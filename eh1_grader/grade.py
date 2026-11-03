@@ -123,9 +123,11 @@ def grade_setlist(
     concurrency: int = 4,
     on_event: Callable[[dict], None] | None = None,
     cancel: threading.Event | None = None,
+    run_ids: list[str] | None = None,
 ) -> Summary:
     """Grade every run of a setlist. `on_event` gets {"event": "grade_start" | "graded" |
-    "grade_error", ...} as it goes; setting `cancel` stops after the runs in progress."""
+    "grade_error", ...} as it goes; setting `cancel` stops after the runs in progress.
+    With `run_ids`, only those runs are graded (again, if they were): one cell's repeats."""
     check_question_set(question_set)
     settings = settings or GraderSettings()
     key = grader_key(settings, question_set)
@@ -138,10 +140,13 @@ def grade_setlist(
     done = set() if regrade else graded_run_ids(traces, setlist_run, key)
     summary = Summary(setlist_run=setlist_run, grader_key=key, runs=len(runs))
     todo = []
+    only = set(run_ids) if run_ids is not None else None
     for run in runs:
+        if only is not None and run.run_id not in only:
+            continue
         if run.question not in questions:
             summary.unmatched += 1
-        elif run.run_id in done:
+        elif only is None and run.run_id in done:
             summary.skipped += 1
         else:
             todo.append(run)

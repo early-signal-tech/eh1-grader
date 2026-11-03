@@ -200,7 +200,12 @@ def _variant_json(value) -> str | None:
 
 
 def write_grade(traces: TracesDB, row: dict) -> None:
-    """Replace this run's grade for this grader setting with `row`."""
+    """Replace this run's grade for this grader setting with `row`. A person's override
+    on the old row is kept unless `row` sets its own: regrading never drops your call."""
+    if row.get("override") is None:
+        kept = current_override(traces, row["run_id"], row["grader_key"])
+        if kept is not None:
+            row = {**row, "override": kept}
     names = list(EVAL_GRADES)
     values = [_variant_json(row.get(n)) if EVAL_GRADES[n] == "VARIANT" else row.get(n) for n in names]
     placeholders = ", ".join("?::JSON::VARIANT" if EVAL_GRADES[n] == "VARIANT" else "?" for n in names)
@@ -217,6 +222,25 @@ def write_grade(traces: TracesDB, row: dict) -> None:
         traces.conn.execute(f"INSERT INTO eval_grades ({quoted}) SELECT {quoted} FROM temp.main.stage_eval_grades")
     finally:
         traces.conn.execute("DELETE FROM temp.main.stage_eval_grades")
+
+
+def current_override(traces: TracesDB, run_id: str, grader_key: str) -> dict | None:
+    rows = traces.execute(f"""
+        SELECT override::JSON::VARCHAR FROM eval_grades
+        WHERE run_id = {lit(run_id)} AND grader_key = {lit(grader_key)} AND override IS NOT NULL
+    """).fetchall()
+    return json.loads(rows[0][0]) if rows and rows[0][0] else None
+
+
+def set_override(traces: TracesDB, run_id: str, grader_key: str, override: dict | None) -> bool:
+    """Store (or, with None, clear) a person's CORRECT and CAREFUL for one graded run.
+    Returns False if the run isn't graded with this setting."""
+    where = f"run_id = {lit(run_id)} AND grader_key = {lit(grader_key)}"
+    if not traces.execute(f"SELECT count(*) FROM eval_grades WHERE {where}").fetchone()[0]:
+        return False
+    value = "NULL" if override is None else f"{lit(json.dumps(override, default=str))}::JSON::VARIANT"
+    traces.execute(f"UPDATE eval_grades SET override = {value} WHERE {where}")
+    return True
 
 
 def graded_run_ids(traces: TracesDB, setlist_run: str, grader_key: str) -> set[str]:

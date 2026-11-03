@@ -279,3 +279,46 @@ def test_serve_refuses_bad_requests(tmp_path):
     server.handle({"id": "x", "type": "dance"})
     errors = [m for m in out.messages() if m["type"] == "error"]
     assert "not a Duck Harness question set" in errors[0]["error"] and "unknown request" in errors[1]["error"]
+
+
+# --- overrides and regrading one cell ---
+
+def test_override_is_kept_next_to_the_judge_and_survives_a_regrade(traces, question_set):
+    from eh1_grader.traces import set_override
+    add_run(traces, "r1", "A1", "A", 1)
+    add_run(traces, "r2", "A1", "A", 2)
+    summary = grade_setlist(traces, question_set, "sl-1", client=FakeClient())
+    key = summary.grader_key
+    assert set_override(traces, "r1", key, {"correct": 0, "careful": 2, "why": "wrong nation"})
+    assert not set_override(traces, "nope", key, {"correct": 0, "careful": 0, "why": ""})
+    grade = {g["run_id"]: g for g in read_grades(traces, "sl-1", key)}["r1"]
+    assert grade["correct"] == 2 and grade["override"]["correct"] == 0 and grade["override"]["why"] == "wrong nation"
+
+    # Regrade just r1 (one cell's repeat): the judge's scores are new, your call stays.
+    events = []
+    again = grade_setlist(traces, question_set, "sl-1", client=FakeClient(), run_ids=["r1"], on_event=events.append)
+    assert again.graded == 1 and events[0]["to_grade"] == 1
+    grade = {g["run_id"]: g for g in read_grades(traces, "sl-1", key)}["r1"]
+    assert grade["override"]["correct"] == 0
+
+    assert set_override(traces, "r1", key, None)
+    assert {g["run_id"]: g for g in read_grades(traces, "sl-1", key)}["r1"]["override"] is None
+
+
+def test_serve_override(tmp_path, traces, question_set):
+    add_run(traces, "r1", "A1")
+    traces.close()
+    out = Output()
+    server = Server(None, out, str(tmp_path / "traces.duckdb"), traces_server=False, client=FakeClient())
+    server.handle({"id": "g", "type": "grade", "setlist_run": "sl-1", "question_set": question_set})
+    server.wait_all()
+    server.handle({"id": "o", "type": "override", "run_id": "r1", "question_set": question_set,
+                   "override": {"correct": 1, "careful": 1, "why": "partly right"}})
+    server.handle({"id": "bad", "type": "override", "run_id": "r1", "question_set": question_set,
+                   "override": {"correct": 3, "careful": 1}})
+    server.handle({"id": "q", "type": "grades", "setlist_run": "sl-1", "question_set": question_set})
+    by_id = {m["id"]: m for m in out.messages()}
+    assert by_id["o"]["type"] == "ok"
+    assert by_id["bad"]["type"] == "error" and "0, 1, or 2" in by_id["bad"]["error"]
+    override = by_id["q"]["grades"][0]["override"]
+    assert (override["correct"], override["careful"], override["why"]) == (1, 1, "partly right") and override["at"]
