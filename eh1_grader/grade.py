@@ -18,7 +18,7 @@ import anthropic
 from duckdb_agent import TracesDB
 
 from .efficiency import DEFAULT_ITERATION_BUDGET, efficiency
-from .judge import DEFAULT_JUDGE_EFFORT, DEFAULT_JUDGE_MODEL, judge
+from .judge import DEFAULT_JUDGE_EFFORT, DEFAULT_JUDGE_MODEL, JUDGE_VERSION, judge
 from .reference import References
 from .rules import check_rules
 from .traces import Run, create_grades_table, graded_run_ids, setlist_runs, write_grade
@@ -43,8 +43,9 @@ class GraderSettings:
 
 
 def grader_key(settings: GraderSettings, question_set: dict) -> str:
-    """Grades are kept per grader setting and question set revision."""
-    payload = {"grader": asdict(settings), "set": question_set["id"], "revision": question_set.get("revision", 1)}
+    """Grades are kept per grader setting, question set revision, and judge version."""
+    payload = {"grader": asdict(settings), "set": question_set["id"], "revision": question_set.get("revision", 1),
+               "judge": JUDGE_VERSION}
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
 
 

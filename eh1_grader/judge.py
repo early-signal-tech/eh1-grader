@@ -12,6 +12,11 @@ from dataclasses import dataclass
 import anthropic
 from duckdb_agent.usage import estimate_cost as agent_estimate_cost
 
+# Goes up when what the judge is asked or answers changes, so grades from a different
+# judge stay apart (it's part of grader_key). 2: each compared value says matches /
+# differs / unverified, instead of a matches flag.
+JUDGE_VERSION = 2
+
 DEFAULT_JUDGE_MODEL = "claude-sonnet-5-5"
 DEFAULT_JUDGE_EFFORT = "low"
 JUDGE_MAX_TOKENS = 8000
@@ -42,9 +47,9 @@ SCHEMA = {
                     "name": {"type": "string"},
                     "agent": {"type": "string"},
                     "reference": {"type": "string"},
-                    "matches": {"type": "boolean"},
+                    "check": {"type": "string", "enum": ["matches", "differs", "unverified"]},
                 },
-                "required": ["name", "agent", "reference", "matches"],
+                "required": ["name", "agent", "reference", "check"],
                 "additionalProperties": False,
             },
         },
@@ -79,8 +84,15 @@ clearly is correct.
 
 Be strict but fair. Set "unsure" when the answer is ambiguous enough that a careful person \
 could score it either way; still give your best scores. In each reason, say in a sentence or two \
-what decided the score. In "values", list the key numbers or facts you compared (agent vs \
-reference); use an empty list when there's nothing to compare."""
+what decided the score.
+
+In "values", list the key numbers or facts in the answer, each with what the reference says:
+- "matches": the reference results or notes give this value, and the answer agrees (within \
+the tolerance).
+- "differs": the reference gives it, and the answer disagrees.
+- "unverified": nothing in the reference results or notes gives this value, so it can't be \
+checked. Leave "reference" empty. Don't mark a value "matches" because it looks plausible.
+Use an empty list when the answer has no values to compare."""
 
 
 @dataclass

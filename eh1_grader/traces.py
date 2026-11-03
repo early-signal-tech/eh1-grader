@@ -157,7 +157,9 @@ EVAL_GRADES = {
     "careful_reason": "VARCHAR",
     "efficient_reason": "VARCHAR",
     "judge_unsure": "BOOLEAN",
-    # [{name, agent, reference, matches}]: the values the judge compared.
+    # [{name, agent, reference, check}]: the values the judge compared, check being
+    # matches | differs | unverified (no reference gives the value). Grades from judge
+    # version 1 have a matches flag instead.
     "judge_values": "VARIANT",
     # [{label, passed, detail}] and whether all passed (NULL when there are none).
     "rules": "VARIANT",

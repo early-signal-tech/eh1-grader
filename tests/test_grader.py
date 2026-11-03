@@ -24,7 +24,8 @@ class FakeClient:
     def __init__(self, verdict=None, stop_reason="end_turn"):
         self.verdict = verdict or {"correct": 2, "correct_reason": "Matches.", "careful": 1,
                                    "careful_reason": "Some caveats.", "unsure": False,
-                                   "values": [{"name": "users", "agent": "100", "reference": "100", "matches": True}]}
+                                   "values": [{"name": "users", "agent": "100", "reference": "100", "check": "matches"},
+                                              {"name": "day count", "agent": "17", "reference": "", "check": "unverified"}]}
         self.stop_reason = stop_reason
         self.calls = []
         self._lock = threading.Lock()
@@ -196,6 +197,10 @@ def test_grade_a_setlist(traces, question_set):
     assert set(grades) == {"r1", "r2", "r3", "r4", "r5"}
     assert (grades["r1"]["correct"], grades["r1"]["careful"], grades["r1"]["efficient"]) == (2, 1, 2)
     assert grades["r1"]["column"] == "A" and grades["r1"]["judge_values"][0]["name"] == "users"
+    assert [v["check"] for v in grades["r1"]["judge_values"]] == ["matches", "unverified"]
+    assert first["output_config"]["format"]["schema"]["properties"]["values"]["items"]["properties"]["check"]["enum"] == [
+        "matches", "differs", "unverified"]
+    assert '"unverified"' in first["system"]
     assert grades["r3"]["rules_passed"] is True and grades["r4"]["rules_passed"] is False
     assert grades["r5"]["correct"] is None and grades["r5"]["efficient"] == 2
     ref = traces.execute("SELECT reference::JSON::VARCHAR FROM eval_grades WHERE run_id = 'r1'").fetchone()[0]
