@@ -5,7 +5,8 @@ duck-harness-serve.
 
 Requests (each has an "id" and a "type"; every message names its request's "id"):
     {"type": "hello"}
-        -> {"type": "hello", "protocol": 1, "defaults": {...GraderSettings}, "judge_models": [...]}
+        -> {"type": "hello", "protocol": 1, "defaults": {...GraderSettings}, "judge_models": [...],
+            "scale": [{score, "2", "1", "0"}, ...]}  (the rubric, for the app to show)
     {"type": "setlists", "grader": {...}, "question_sets": [{"id", "revision"}, ...]}
         -> {"type": "setlists", "setlists": [{id, name, note, question_set, revision, runs,
             completed, cancelled, columns, repeats, concurrency, cost_usd, started_at, ended_at,
@@ -59,7 +60,7 @@ from duckdb_agent import connect_traces_db
 from duckdb_agent.config import API_MAX_RETRIES
 
 from .grade import GraderSettings, check_question_set, grade_one, grade_setlist, grader_key
-from .judge import JUDGE_PRICING
+from .judge import JUDGE_PRICING, SCALE
 from .traces import (
     MAX_NAME, MAX_NOTE, clean_text, create_tables, grading_status, list_runs, list_setlists, read_grades, rename_setlist,
     run_detail, run_grades, set_override, setlist_exists,
@@ -115,7 +116,7 @@ class Server:
             if kind == "hello":
                 self.send({"id": rid, "type": "hello", "protocol": PROTOCOL_VERSION,
                            "defaults": dataclasses.asdict(GraderSettings()),
-                           "judge_models": ["claude-haiku-5-5", *JUDGE_PRICING]})
+                           "judge_models": ["claude-haiku-5-5", *JUDGE_PRICING], "scale": SCALE})
             elif kind == "setlists":
                 self.setlists(rid, request)
             elif kind == "rename":

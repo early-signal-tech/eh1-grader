@@ -18,8 +18,8 @@ from typing import Callable
 import anthropic
 from duckdb_agent import TracesDB
 
-from .efficiency import DEFAULT_ITERATION_BUDGET, efficiency
-from .judge import DEFAULT_JUDGE_EFFORT, DEFAULT_JUDGE_MODEL, JUDGE_VERSION, judge
+from .efficiency import DEFAULT_ITERATION_BUDGET, DEFAULT_WASTE_FOR_ONE, efficiency
+from .judge import DEFAULT_JUDGE_EFFORT, DEFAULT_JUDGE_MODEL, JUDGE_VERSION, MAX_INSTRUCTIONS, judge
 from .reference import References
 from .rules import check_rules
 from .traces import Run, create_tables, graded_run_ids, run_by_id, run_grades, setlist_runs, source_spec, write_grade
@@ -36,16 +36,30 @@ class GraderSettings:
     judge_effort: str = DEFAULT_JUDGE_EFFORT
     tolerance: str = "±0.5%"
     iteration_budget: int = DEFAULT_ITERATION_BUDGET
+    # Your own notes to the judge, sent with every question (the Rubric flyout).
+    instructions: str = ""
+    # EFFICIENT: how much waste still scores 1 (the Efficient flyout).
+    waste_for_one: int = DEFAULT_WASTE_FOR_ONE
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "GraderSettings":
         known = {k: v for k, v in (data or {}).items() if k in cls.__dataclass_fields__}
-        return cls(**known)
+        settings = cls(**known)
+        settings.instructions = str(settings.instructions or "").strip()[:MAX_INSTRUCTIONS]
+        settings.iteration_budget = min(50, max(1, int(settings.iteration_budget)))
+        settings.waste_for_one = min(10, max(0, int(settings.waste_for_one)))
+        return settings
+
+
+# Settings added after grades were already stored: left out of the key while at their
+# defaults, so those grades keep their keys.
+LATER_SETTINGS = {"instructions": "", "waste_for_one": DEFAULT_WASTE_FOR_ONE}
 
 
 def grader_key(settings: GraderSettings, question_set: dict) -> str:
     """Grades are kept per grader setting, question set revision, and judge version."""
-    payload = {"grader": asdict(settings), "set": question_set["id"], "revision": question_set.get("revision", 1),
+    grader = {k: v for k, v in asdict(settings).items() if not (k in LATER_SETTINGS and v == LATER_SETTINGS[k])}
+    payload = {"grader": grader, "set": question_set["id"], "revision": question_set.get("revision", 1),
                "judge": JUDGE_VERSION}
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -88,7 +102,7 @@ def grade_run(run: Run, question: dict, question_set: dict, settings: GraderSett
     """One run's grade row (for eval_grades)."""
     check = normalize_check(question.get("check"))
     rules, rules_passed = check_rules(check.get("rules", []), run)
-    eff, eff_reason = efficiency(run, settings.iteration_budget)
+    eff, eff_reason = efficiency(run, settings.iteration_budget, settings.waste_for_one)
     row = {
         "run_id": run.run_id, "grader_key": key, "graded_at": datetime.now(),
         "setlist_run": run.labels.get("setlist_run"), "question_set": question_set["id"],
@@ -104,7 +118,8 @@ def grade_run(run: Run, question: dict, question_set: dict, settings: GraderSett
     row["reference"] = [{k: r[k] for k in ("sql", "rows", "columns", "preview", "error")} for r in refs]
     if client is None:
         return {**row, "judge_error": "no judge (no API client)"}
-    verdict = judge(client, question, check, refs, run.answer, settings.judge_model, settings.judge_effort, settings.tolerance)
+    verdict = judge(client, question, check, refs, run.answer, settings.judge_model, settings.judge_effort, settings.tolerance,
+                    settings.instructions)
     return {
         **row,
         "correct": verdict.correct, "careful": verdict.careful,

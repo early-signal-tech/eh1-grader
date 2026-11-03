@@ -8,7 +8,7 @@ Here that is:
   iteration budget.
 - Otherwise count the waste: failed tool calls, repeated identical queries, and every
   truncated result after the first. 2 with no waste and within budget; 1 with at most
-  two pieces of waste and at most twice the budget; else 0.
+  `waste_for_one` pieces of waste (2 by default) and at most twice the budget; else 0.
 """
 
 import re
@@ -18,13 +18,15 @@ from .traces import Run
 LIMIT_STATUSES = {"max_iterations", "max_tokens", "context_window_exceeded"}
 
 DEFAULT_ITERATION_BUDGET = 8
+DEFAULT_WASTE_FOR_ONE = 2
 
 
 def _normalize(sql: str) -> str:
     return re.sub(r"\s+", " ", sql.strip().rstrip(";")).lower()
 
 
-def efficiency(run: Run, iteration_budget: int = DEFAULT_ITERATION_BUDGET) -> tuple[int, str]:
+def efficiency(run: Run, iteration_budget: int = DEFAULT_ITERATION_BUDGET,
+               waste_for_one: int = DEFAULT_WASTE_FOR_ONE) -> tuple[int, str]:
     """(score, reason)."""
     if run.status in LIMIT_STATUSES:
         return 0, f"hit a limit ({run.status.replace('_', ' ')})"
@@ -49,6 +51,6 @@ def efficiency(run: Run, iteration_budget: int = DEFAULT_ITERATION_BUDGET) -> tu
         return 0, reason + f" (budget {iteration_budget})"
     if waste == 0 and run.iterations <= iteration_budget:
         return 2, reason
-    if waste <= 2:
+    if waste <= waste_for_one:
         return 1, reason
     return 0, reason
