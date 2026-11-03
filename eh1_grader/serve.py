@@ -6,9 +6,16 @@ duck-harness-serve.
 Requests (each has an "id" and a "type"; every message names its request's "id"):
     {"type": "hello"}
         -> {"type": "hello", "protocol": 1, "defaults": {...GraderSettings}, "judge_models": [...]}
-    {"type": "setlists"}
+    {"type": "setlists", "grader": {...}, "question_sets": [{"id", "revision"}, ...]}
         -> {"type": "setlists", "setlists": [{id, name, note, question_set, revision, runs,
-            completed, columns, repeats, concurrency, cost_usd, started_at, ended_at}, ...]}
+            completed, cancelled, columns, repeats, concurrency, cost_usd, started_at, ended_at,
+            presets: [{column, name, modified, config}], grading}, ...]}
+        grading is {graded, total, other_settings} under these grader settings, with the
+        question set revision the app would grade with (from "question_sets", the sets it
+        has, in its order); it's left out without "grader".
+    {"type": "rename", "setlist_run": "sl-…", "name": "…" | null, "note": "…" | null}
+        -> {"type": "ok"}  (your name and note for a setlist, kept in eval_setlists; blank
+        or null shows DH-1's again)
     {"type": "grade", "setlist_run": "sl-…", "question_set": {...the set's JSON},
      "grader": {...GraderSettings fields}, "regrade": false, "concurrency": 4}
         -> {"type": "accepted"}
@@ -40,9 +47,23 @@ from duckdb_agent.config import API_MAX_RETRIES
 
 from .grade import GraderSettings, check_question_set, grade_setlist, grader_key
 from .judge import JUDGE_PRICING
-from .traces import create_grades_table, list_setlists, read_grades, set_override
+from .traces import (
+    MAX_NAME, MAX_NOTE, clean_text, create_tables, grading_status, list_setlists, read_grades, rename_setlist,
+    set_override, setlist_exists,
+)
 
 PROTOCOL_VERSION = 1
+
+
+def grading_revision(setlist: dict, sets: list[dict]) -> int:
+    """The question set revision the app grades a setlist with: the one it ran, when the app
+    has it; else the first the app has with that id; else the one it ran (as the app's
+    findSet)."""
+    same = [s.get("revision", 1) for s in sets if s["id"] == setlist["question_set"]]
+    ran = setlist.get("revision")
+    if ran is None:
+        return same[0] if same else 1
+    return ran if ran in same or not same else same[0]
 
 
 class Server:
@@ -83,18 +104,16 @@ class Server:
                            "defaults": dataclasses.asdict(GraderSettings()),
                            "judge_models": ["claude-haiku-5-5", *JUDGE_PRICING]})
             elif kind == "setlists":
-                traces = self.traces()
-                try:
-                    self.send({"id": rid, "type": "setlists", "setlists": list_setlists(traces)})
-                finally:
-                    traces.close()
+                self.setlists(rid, request)
+            elif kind == "rename":
+                self.rename(rid, request)
             elif kind == "grades":
                 question_set = request.get("question_set") or {}
                 check_question_set(question_set)
                 key = grader_key(GraderSettings.from_dict(request.get("grader")), question_set)
                 traces = self.traces()
                 try:
-                    create_grades_table(traces)
+                    create_tables(traces)
                     grades = read_grades(traces, request.get("setlist_run", ""), key)
                 finally:
                     traces.close()
@@ -121,6 +140,38 @@ class Server:
             self.error(rid, f"{type(e).__name__}: {e}")
         return True
 
+    def setlists(self, rid: str, request: dict) -> None:
+        traces = self.traces()
+        try:
+            create_tables(traces)
+            setlists = list_setlists(traces)
+            if request.get("grader") is not None:
+                settings = GraderSettings.from_dict(request.get("grader"))
+                sets = [s for s in request.get("question_sets") or [] if isinstance(s, dict) and s.get("id")]
+                keys = {s["id"]: grader_key(settings, {"id": s["question_set"], "revision": grading_revision(s, sets)})
+                        for s in setlists}
+                status = grading_status(traces, keys)
+                for s in setlists:
+                    s["grading"] = status[s["id"]]
+        finally:
+            traces.close()
+        self.send({"id": rid, "type": "setlists", "setlists": setlists})
+
+    def rename(self, rid: str, request: dict) -> None:
+        setlist_run = request.get("setlist_run")
+        if not isinstance(setlist_run, str) or not setlist_run:
+            raise ValueError('"setlist_run" must be a setlist ID')
+        traces = self.traces()
+        try:
+            create_tables(traces)
+            if not setlist_exists(traces, setlist_run):
+                raise ValueError(f"no setlist {setlist_run!r} in the traces")
+            rename_setlist(traces, setlist_run, clean_text(request.get("name"), MAX_NAME),
+                           clean_text(request.get("note"), MAX_NOTE))
+        finally:
+            traces.close()
+        self.send({"id": rid, "type": "ok"})
+
     def override(self, rid: str, request: dict) -> None:
         """Your CORRECT and CAREFUL for one graded run, kept next to the judge's."""
         question_set = request.get("question_set") or {}
@@ -137,7 +188,7 @@ class Server:
                      "why": str(value.get("why") or "").strip()[:500], "at": datetime.now().isoformat(timespec="seconds")}
         traces = self.traces()
         try:
-            create_grades_table(traces)
+            create_tables(traces)
             if not set_override(traces, str(request.get("run_id", "")), key, value):
                 raise ValueError("that run isn't graded with these settings")
         finally:

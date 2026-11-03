@@ -13,7 +13,7 @@ from eh1_grader.judge import build_prompt
 from eh1_grader.reference import References
 from eh1_grader.rules import check_rules
 from eh1_grader.serve import Server
-from eh1_grader.traces import Run, ToolCall, list_setlists, read_grades, setlist_runs
+from eh1_grader.traces import Run, ToolCall, create_tables, list_setlists, read_grades, rename_setlist, setlist_runs
 
 
 # --- fakes ---
@@ -68,13 +68,16 @@ def traces(tmp_path):
 
 
 def add_run(traces, run_id, question, column="A", repeat=1, status="completed", iterations=2,
-            answer="There are 100 users.", calls=(), setlist_run="sl-1"):
+            answer="There are 100 users.", calls=(), setlist_run="sl-1", effort="low"):
     labels = {"setlist": "mini", "setlist_revision": 1, "setlist_run": setlist_run, "setlist_name": "Test",
               "question": question, "column": column, "repeat": repeat}
+    preset = {"id": f"p-{column}", "name": f"Preset {column}", "revision": 1, "modified": column == "B"}
+    config = {"model": "claude-haiku-5-5", "effort": effort, "max_iterations": 10}
     traces.conn.execute(
-        "INSERT INTO agent_runs (run_id, prompt, final_response, status, total_iterations, labels, started_at, "
-        "estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?::JSON::VARIANT, now(), 0.001)",
-        [run_id, "q", answer, status, iterations, json.dumps(labels)],
+        "INSERT INTO agent_runs (run_id, prompt, final_response, status, total_iterations, labels, preset, config, "
+        "started_at, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?::JSON::VARIANT, ?::JSON::VARIANT, ?::JSON::VARIANT, "
+        "now(), 0.001)",
+        [run_id, "q", answer, status, iterations, json.dumps(labels), json.dumps(preset), json.dumps(config)],
     )
     for c in calls:
         traces.insert("tool_calls", {"run_id": run_id, "iteration": c.iteration, "tool_name": c.tool.replace("_", " ").title(),
@@ -236,13 +239,31 @@ def test_grader_key_depends_on_settings_and_set_revision(question_set):
 
 
 def test_list_setlists(traces):
+    create_tables(traces)
     add_run(traces, "r1", "A1", "A", 1)
-    add_run(traces, "r2", "A1", "B", 1, status="max_iterations")
+    add_run(traces, "r2", "A1", "B", 1, status="max_iterations", effort="high")
+    add_run(traces, "r4", "H1", "B", 1, status="cancelled", effort="high")
     add_run(traces, "r3", "A1", "A", 1, setlist_run="sl-2")
     setlists = {s["id"]: s for s in list_setlists(traces)}
-    assert setlists["sl-1"]["runs"] == 2 and setlists["sl-1"]["completed"] == 1
-    assert setlists["sl-1"]["columns"] == 2 and setlists["sl-1"]["name"] == "Test"
+    one = setlists["sl-1"]
+    assert one["runs"] == 3 and one["completed"] == 1 and one["cancelled"] == 1
+    assert one["columns"] == 2 and one["name"] == "Test"
+    assert [(p["column"], p["name"], p["modified"], p["config"]["effort"]) for p in one["presets"]] == [
+        ("A", "Preset A", False, "low"), ("B", "Preset B", True, "high")]
     assert len(setlist_runs(traces, "sl-2")) == 1
+
+
+def test_rename_is_yours_and_blank_shows_dh1s_again(traces):
+    create_tables(traces)
+    add_run(traces, "r1", "A1")
+    rename_setlist(traces, "sl-1", "After the prompt change", None)
+    s = list_setlists(traces)[0]
+    assert (s["name"], s["note"]) == ("After the prompt change", None)
+    rename_setlist(traces, "sl-1", None, "Haiku only")
+    s = list_setlists(traces)[0]
+    assert (s["name"], s["note"]) == ("Test", "Haiku only")  # DH-1's label is back
+    rename_setlist(traces, "sl-1", None, None)
+    assert traces.execute("SELECT count(*) FROM eval_setlists").fetchone()[0] == 0
 
 
 # --- the app protocol ---
@@ -322,3 +343,41 @@ def test_serve_override(tmp_path, traces, question_set):
     assert by_id["bad"]["type"] == "error" and "0, 1, or 2" in by_id["bad"]["error"]
     override = by_id["q"]["grades"][0]["override"]
     assert (override["correct"], override["careful"], override["why"]) == (1, 1, "partly right") and override["at"]
+
+
+def test_serve_setlists_with_grading_status_and_rename(tmp_path, traces, question_set):
+    add_run(traces, "r1", "A1")
+    add_run(traces, "r2", "H1")
+    add_run(traces, "r3", "A1", setlist_run="sl-2")
+    traces.close()
+    out = Output()
+    server = Server(None, out, str(tmp_path / "traces.duckdb"), traces_server=False, client=FakeClient())
+    server.handle({"id": "g", "type": "grade", "setlist_run": "sl-1", "question_set": question_set,
+                   "run_ids": ["r1"]})
+    server.wait_all()
+    sets = [{"id": "mini", "revision": 1}]
+    server.handle({"id": "s", "type": "setlists", "grader": {}, "question_sets": sets})
+    server.handle({"id": "o", "type": "setlists", "grader": {"judge_model": "claude-opus-5-5"}, "question_sets": sets})
+    server.handle({"id": "n", "type": "rename", "setlist_run": "sl-2", "name": "  Second   try ", "note": ""})
+    server.handle({"id": "bad", "type": "rename", "setlist_run": "sl-9", "name": "x"})
+    server.handle({"id": "plain", "type": "setlists"})
+    by_id = {m["id"]: m for m in out.messages()}
+    now = {s["id"]: s for s in by_id["s"]["setlists"]}
+    # r1 graded: A1's judge says 2 + 1, the trace says 2 for efficiency.
+    assert now["sl-1"]["grading"] == {"graded": 1, "total": 5.0, "other_settings": 0}
+    assert now["sl-2"]["grading"]["graded"] == 0
+    other = {s["id"]: s for s in by_id["o"]["setlists"]}
+    assert other["sl-1"]["grading"] == {"graded": 0, "total": None, "other_settings": 1}
+    assert by_id["n"]["type"] == "ok"
+    assert by_id["bad"]["type"] == "error" and "no setlist" in by_id["bad"]["error"]
+    plain = {s["id"]: s for s in by_id["plain"]["setlists"]}
+    assert plain["sl-2"]["name"] == "Second try" and "grading" not in plain["sl-2"]
+
+
+def test_grading_revision_follows_the_apps_sets():
+    from eh1_grader.serve import grading_revision
+    ran = {"question_set": "mini", "revision": 1}
+    assert grading_revision(ran, [{"id": "mini", "revision": 2}, {"id": "mini", "revision": 1}]) == 1
+    assert grading_revision(ran, [{"id": "mini", "revision": 2}]) == 2
+    assert grading_revision(ran, []) == 1
+    assert grading_revision({"question_set": "mini", "revision": None}, [{"id": "mini", "revision": 3}]) == 3
