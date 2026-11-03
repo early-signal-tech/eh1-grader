@@ -32,6 +32,13 @@ FROM eval_grades g JOIN agent_runs r USING (run_id)
 WHERE g.setlist_run = 'sl-…' ORDER BY g.question;
 ```
 
+## Overrides
+
+When you disagree with the judge, set your own CORRECT and CAREFUL (0–2) and a reason.
+It's stored next to the judge's scores in `eval_grades.override` (`{correct, careful, why,
+at}`), never replacing them. Scorecards use yours where it's set. Regrading a run keeps
+your override. EFFICIENT comes from the traces, so it isn't overridden.
+
 ## Use
 
 Needs the agent checkout next to this one (it's a path dependency), and an
