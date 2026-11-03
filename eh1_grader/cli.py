@@ -20,7 +20,7 @@ from duckdb_agent import connect_traces_db
 from duckdb_agent.config import API_MAX_RETRIES
 
 from .grade import GraderSettings, grade_setlist
-from .traces import list_setlists, read_grades
+from .traces import create_tables, list_setlists, read_grades
 
 DEFAULT_TRACES = str(Path(__file__).resolve().parent.parent.parent / "duckdb-analytics-agent" / "agent_traces.duckdb")
 
@@ -75,6 +75,7 @@ def main(argv=None) -> int:
     traces = connect_traces_db(args.traces_db)
     try:
         if args.list:
+            create_tables(traces)
             for s in list_setlists(traces):
                 print(f"{s['id']}  {s['question_set']} r{s['revision']}  {s['runs']} runs  "
                       f"{s['name'] or ''}  {s['started_at']}")

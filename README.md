@@ -32,6 +32,12 @@ FROM eval_grades g JOIN agent_runs r USING (run_id)
 WHERE g.setlist_run = 'sl-…' ORDER BY g.question;
 ```
 
+## Setlist names
+
+Rename a setlist in EH-1 and your name and note go in `eval_setlists` (one row per
+setlist), never into the agent's run labels. They win over the name DH-1 labelled the
+runs with. Clear them and DH-1's name, or the suggested title, shows again.
+
 ## Overrides
 
 When you disagree with the judge, set your own CORRECT and CAREFUL (0–2) and a reason.
@@ -68,7 +74,7 @@ output (a JSON schema), since Sonnet 5.5 and Opus 5.5 reject a forced tool choic
 
 ```
 eh1_grader/
-  traces.py      reading runs and tool calls; the eval_grades table
+  traces.py      reading runs and tool calls; the eval_grades and eval_setlists tables
   rules.py       trace rules
   efficiency.py  EFFICIENT
   reference.py   reference SQL on the run's data (read-only, cached)

@@ -1,4 +1,5 @@
-"""Reading runs from the agent's traces, and the eval_grades table EH-1 writes there.
+"""Reading runs from the agent's traces, and the tables EH-1 writes there (eval_grades,
+eval_setlists).
 
 The traces database belongs to the agent (duckdb-analytics-agent). EH-1 connects the
 same way the agent does, through its background Quack server, so it can read while
@@ -103,35 +104,113 @@ def setlist_runs(traces: TracesDB, setlist_run: str) -> list[Run]:
 
 
 def list_setlists(traces: TracesDB) -> list[dict]:
-    """Every setlist in the traces, newest first: its ID, name, set, size, and status."""
+    """Every setlist in the traces, newest first: its ID, name, set, size, status, and the
+    preset each column ran. A name or note set in EH-1 (eval_setlists) wins over the one
+    DH-1 labelled the runs with. Needs the EH-1 tables (`create_tables`)."""
     rows = traces.execute("""
-        SELECT labels.setlist_run::VARCHAR AS id,
-               any_value(labels.setlist::VARCHAR) AS question_set,
-               max(labels.setlist_revision::INTEGER) AS revision,
-               any_value(labels.setlist_name::VARCHAR) AS name,
-               any_value(labels.setlist_note::VARCHAR) AS note,
-               max(labels.setlist_concurrency::INTEGER) AS concurrency,
-               count(*) AS runs,
-               count(*) FILTER (WHERE status = 'completed') AS completed,
-               count(DISTINCT labels."column"::VARCHAR) AS columns,
-               max(labels."repeat"::INTEGER) AS repeats,
-               sum(estimated_cost_usd) AS cost_usd,
-               min(started_at) AS started_at,
-               max(ended_at) AS ended_at
+        WITH s AS (
+            SELECT labels.setlist_run::VARCHAR AS id,
+                   any_value(labels.setlist::VARCHAR) AS question_set,
+                   max(labels.setlist_revision::INTEGER) AS revision,
+                   any_value(labels.setlist_name::VARCHAR) AS label_name,
+                   any_value(labels.setlist_note::VARCHAR) AS label_note,
+                   max(labels.setlist_concurrency::INTEGER) AS concurrency,
+                   count(*) AS runs,
+                   count(*) FILTER (WHERE status = 'completed') AS completed,
+                   count(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+                   count(DISTINCT labels."column"::VARCHAR) AS columns,
+                   max(labels."repeat"::INTEGER) AS repeats,
+                   sum(estimated_cost_usd) AS cost_usd,
+                   min(started_at) AS started_at,
+                   max(ended_at) AS ended_at
+            FROM agent_runs
+            WHERE labels.setlist_run IS NOT NULL
+            GROUP BY ALL
+        )
+        SELECT s.id, s.question_set, s.revision, coalesce(n.name, s.label_name), coalesce(n.note, s.label_note),
+               s.concurrency, s.runs, s.completed, s.cancelled, s.columns, s.repeats, s.cost_usd,
+               s.started_at, s.ended_at
+        FROM s LEFT JOIN eval_setlists n ON n.setlist_run = s.id
+        ORDER BY s.started_at DESC
+    """).fetchall()
+    keys = ["id", "question_set", "revision", "name", "note", "concurrency", "runs", "completed", "cancelled",
+            "columns", "repeats", "cost_usd", "started_at", "ended_at"]
+    presets: dict[str, list[dict]] = {}
+    for setlist, column, preset, config in traces.execute("""
+        SELECT labels.setlist_run::VARCHAR, labels."column"::VARCHAR,
+               any_value(preset::JSON::VARCHAR), any_value(config::JSON::VARCHAR)
         FROM agent_runs
         WHERE labels.setlist_run IS NOT NULL
         GROUP BY ALL
-        ORDER BY started_at DESC
-    """).fetchall()
-    keys = ["id", "question_set", "revision", "name", "note", "concurrency", "runs", "completed",
-            "columns", "repeats", "cost_usd", "started_at", "ended_at"]
+        ORDER BY 1, 2
+    """).fetchall():
+        preset = json.loads(preset) if preset else {}
+        presets.setdefault(setlist, []).append({
+            "column": column, "name": preset.get("name"), "modified": bool(preset.get("modified")),
+            "config": json.loads(config) if config else {},
+        })
     out = []
     for row in rows:
         item = dict(zip(keys, row))
         for k in ("started_at", "ended_at"):
             item[k] = item[k].isoformat() if item[k] is not None else None
+        item["presets"] = presets.get(item["id"], [])
         out.append(item)
     return out
+
+
+def grading_status(traces: TracesDB, keys: dict[str, str]) -> dict[str, dict]:
+    """For each setlist in `keys` (setlist ID -> the grader key it would be graded with now):
+    how many of its runs are graded with that key, their average total out of 6 (your
+    overrides counted), and how many other grader settings have graded it."""
+    rows = traces.execute("""
+        SELECT setlist_run, grader_key, count(*),
+               avg(coalesce(override.correct::INTEGER, correct) + coalesce(override.careful::INTEGER, careful) + efficient)
+        FROM eval_grades
+        GROUP BY ALL
+    """).fetchall()
+    out = {sid: {"graded": 0, "total": None, "other_settings": 0} for sid in keys}
+    for setlist, key, graded, total in rows:
+        if setlist not in out:
+            continue
+        if key == keys[setlist]:
+            out[setlist].update(graded=graded, total=total)
+        else:
+            out[setlist]["other_settings"] += 1
+    return out
+
+
+# --- eval_setlists: EH-1's names for setlists ---
+
+EVAL_SETLISTS = {
+    "setlist_run": "VARCHAR",
+    # Your words, exactly as typed (whitespace tidied). NULL: use the name or note DH-1
+    # labelled the runs with, if any.
+    "name": "VARCHAR",
+    "note": "VARCHAR",
+    "renamed_at": "TIMESTAMP",
+}
+MAX_NAME, MAX_NOTE = 80, 200
+
+
+def clean_text(value, limit: int) -> str | None:
+    """Whitespace tidied and cut to `limit`; blank is None (as DH-1's cleanName)."""
+    text = " ".join(str(value or "").split())[:limit]
+    return text or None
+
+
+def setlist_exists(traces: TracesDB, setlist_run: str) -> bool:
+    return bool(traces.execute(
+        f"SELECT count(*) FROM agent_runs WHERE labels.setlist_run::VARCHAR = {lit(setlist_run)}").fetchone()[0])
+
+
+def rename_setlist(traces: TracesDB, setlist_run: str, name: str | None, note: str | None) -> None:
+    """Give a setlist your name and note. None for both drops EH-1's row, so DH-1's labels
+    (or the suggested title) show again."""
+    traces.execute(f"DELETE FROM eval_setlists WHERE setlist_run = {lit(setlist_run)}")
+    if name is None and note is None:
+        return
+    traces.execute(f"INSERT INTO eval_setlists VALUES ({lit(setlist_run)}, {lit(name)}, {lit(note)}, now()::TIMESTAMP)")
 
 
 # --- eval_grades: one row per run per grader setting ---
@@ -174,21 +253,27 @@ EVAL_GRADES = {
 }
 
 
-def create_grades_table(traces: TracesDB) -> None:
-    """Create eval_grades if it isn't there (on the traces server when connected to one)."""
-    columns = ", ".join(f'"{name}" {spec}' for name, spec in EVAL_GRADES.items())
-    ddl = f"CREATE TABLE IF NOT EXISTS eval_grades ({columns})"
+def create_tables(traces: TracesDB) -> None:
+    """Create EH-1's tables (eval_grades, eval_setlists) if they aren't there, on the traces
+    server when connected to one."""
+    tables = {"eval_grades": EVAL_GRADES, "eval_setlists": EVAL_SETLISTS}
+    ddl = {name: f"CREATE TABLE IF NOT EXISTS {name} (" + ", ".join(f'"{c}" {t}' for c, t in columns.items()) + ")"
+           for name, columns in tables.items()}
     if not traces.remote:
-        traces.conn.execute(ddl)
+        for sql in ddl.values():
+            traces.conn.execute(sql)
         return
     run = lambda sql: traces.conn.execute(  # noqa: E731
         "SELECT * FROM quack_query(?, ?, token = ?)", [traces.quack_uri, sql, traces._token]).fetchall()
-    exists = run("SELECT count(*) FROM information_schema.tables WHERE table_name = 'eval_grades'")[0][0]
-    if exists:
+    names = ", ".join(lit(n) for n in tables)
+    existing = {r[0] for r in run(f"SELECT table_name FROM information_schema.tables WHERE table_name IN ({names})")}
+    missing = [n for n in tables if n not in existing]
+    if not missing:
         return
-    run(ddl)
+    for name in missing:
+        run(ddl[name])
     # The attached catalog lists the server's tables as of attaching: attach again so
-    # this connection sees the new table.
+    # this connection sees the new tables.
     traces.conn.execute("USE memory")
     traces.conn.execute("DETACH traces")
     traces.conn.execute("ATTACH ? AS traces (TYPE quack, TOKEN ?)", [traces.quack_uri, traces._token])

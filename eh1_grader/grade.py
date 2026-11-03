@@ -21,7 +21,7 @@ from .efficiency import DEFAULT_ITERATION_BUDGET, efficiency
 from .judge import DEFAULT_JUDGE_EFFORT, DEFAULT_JUDGE_MODEL, JUDGE_VERSION, judge
 from .reference import References
 from .rules import check_rules
-from .traces import Run, create_grades_table, graded_run_ids, setlist_runs, write_grade
+from .traces import Run, create_tables, graded_run_ids, setlist_runs, write_grade
 
 SUPPORTED_FORMAT_VERSION = 2
 
@@ -133,7 +133,7 @@ def grade_setlist(
     key = grader_key(settings, question_set)
     emit = on_event or (lambda event: None)
     cancel = cancel or threading.Event()
-    create_grades_table(traces)
+    create_tables(traces)
 
     runs = setlist_runs(traces, setlist_run)
     questions = {q["id"]: q for q in question_set["questions"]}
