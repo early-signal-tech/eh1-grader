@@ -68,16 +68,19 @@ def traces(tmp_path):
 
 
 def add_run(traces, run_id, question, column="A", repeat=1, status="completed", iterations=2,
-            answer="There are 100 users.", calls=(), setlist_run="sl-1", effort="low"):
-    labels = {"setlist": "mini", "setlist_revision": 1, "setlist_run": setlist_run, "setlist_name": "Test",
-              "question": question, "column": column, "repeat": repeat}
+            answer="There are 100 users.", calls=(), setlist_run="sl-1", effort="low", labels=None, prompt="q",
+            data_source=None):
+    if labels is None:
+        labels = {"setlist": "mini", "setlist_revision": 1, "setlist_run": setlist_run, "setlist_name": "Test",
+                  "question": question, "column": column, "repeat": repeat}
     preset = {"id": f"p-{column}", "name": f"Preset {column}", "revision": 1, "modified": column == "B"}
     config = {"model": "claude-haiku-5-5", "effort": effort, "max_iterations": 10}
     traces.conn.execute(
         "INSERT INTO agent_runs (run_id, prompt, final_response, status, total_iterations, labels, preset, config, "
-        "started_at, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?::JSON::VARIANT, ?::JSON::VARIANT, ?::JSON::VARIANT, "
-        "now(), 0.001)",
-        [run_id, "q", answer, status, iterations, json.dumps(labels), json.dumps(preset), json.dumps(config)],
+        "data_source, started_at, estimated_cost_usd) VALUES (?, ?, ?, ?, ?, ?::JSON::VARIANT, ?::JSON::VARIANT, "
+        "?::JSON::VARIANT, ?::JSON::VARIANT, now(), 0.001)",
+        [run_id, prompt, answer, status, iterations, json.dumps(labels) if labels else None, json.dumps(preset),
+         json.dumps(config), json.dumps(data_source) if data_source else None],
     )
     for c in calls:
         traces.insert("tool_calls", {"run_id": run_id, "iteration": c.iteration, "tool_name": c.tool.replace("_", " ").title(),
@@ -381,3 +384,97 @@ def test_grading_revision_follows_the_apps_sets():
     assert grading_revision(ran, [{"id": "mini", "revision": 2}]) == 2
     assert grading_revision(ran, []) == 1
     assert grading_revision({"question_set": "mini", "revision": None}, [{"id": "mini", "revision": 3}]) == 3
+
+
+# --- RUN mode: one run at a time ---
+
+def test_list_runs_by_kind_and_search(traces):
+    from eh1_grader.traces import list_runs
+    create_tables(traces)
+    add_run(traces, "s1", "A1")
+    add_run(traces, "one", None, labels={}, prompt="What was revenue in July?")
+    add_run(traces, "a", None, labels={"ab": "A", "pair": "ab-1"}, prompt="Top customers")
+    ids = lambda kind, search="": [r["run_id"] for r in list_runs(traces, kind, search)]  # noqa: E731
+    assert set(ids("all")) == {"s1", "one", "a"}
+    assert ids("single") == ["one"] and ids("ab") == ["a"] and ids("setlist") == ["s1"]
+    assert ids("all", "revenue july") == ["one"]
+    with pytest.raises(ValueError):
+        list_runs(traces, "nope")
+
+
+def test_a_runs_data_comes_from_what_it_asked_for(traces, data_db):
+    from eh1_grader.traces import run_by_id, source_spec
+    add_run(traces, "t", None, labels={}, data_source={"tpch": 0.01})
+    add_run(traces, "d", None, labels={}, data_source={"db": data_db, "schema": "gold"})
+    add_run(traces, "old", None, labels={})
+    assert source_spec(run_by_id(traces, "t")) == {"kind": "tpch", "tpchScale": 0.01}
+    assert source_spec(run_by_id(traces, "d")) == {"kind": "db", "dbPath": data_db, "schema": "gold"}
+    assert source_spec(run_by_id(traces, "old")) is None
+
+
+def test_grade_one_against_a_question_shares_the_setlist_grade(traces, question_set):
+    from eh1_grader.grade import grade_one
+    add_run(traces, "r1", "A1")
+    grade = grade_one(traces, "r1", client=FakeClient(), question_set=question_set, question_id="A1")
+    assert (grade["question_set"], grade["question"], grade["correct"]) == ("mini", "A1", 2)
+    # The same key a setlist grading uses: the scorecard sees it.
+    assert read_grades(traces, "sl-1", grader_key(GraderSettings(), question_set))[0]["run_id"] == "r1"
+    with pytest.raises(ValueError, match="no question"):
+        grade_one(traces, "r1", client=FakeClient(), question_set=question_set, question_id="Z9")
+
+
+def test_a_quick_check_runs_its_sql_on_the_runs_own_data(traces, data_db):
+    from eh1_grader.grade import grade_one
+    add_run(traces, "q1", None, labels={}, prompt="How many users?", data_source={"db": data_db, "schema": "gold"})
+    client = FakeClient()
+    check = {"correct": "Says 100 users.", "sql": ["SELECT count(*) AS users FROM users"], "careful": ""}
+    grade = grade_one(traces, "q1", client=client, quick_check=check)
+    assert grade["question_set"] == "quick" and grade["question"] is None
+    assert grade["quick_check"]["correct"] == "Says 100 users." and "careful" not in grade["quick_check"]
+    assert grade["reference"][0]["rows"] == 1 and "100" in grade["reference"][0]["preview"]
+    assert "How many users?" in json.dumps(client.calls[0]["messages"])
+    # A different check is a different grade, beside the first.
+    again = grade_one(traces, "q1", client=client, quick_check={**check, "correct": "Says 100."})
+    assert again["grader_key"] != grade["grader_key"]
+    with pytest.raises(ValueError, match="correct"):
+        grade_one(traces, "q1", client=client, quick_check={"careful": "x"})
+
+
+def test_a_quick_check_on_a_run_without_recorded_data(traces):
+    from eh1_grader.grade import grade_one
+    add_run(traces, "old", None, labels={}, prompt="How many?")
+    grade = grade_one(traces, "old", client=FakeClient(), quick_check={"correct": "100", "sql": ["SELECT 1"]})
+    assert "didn't record its data" in grade["reference"][0]["error"]
+    assert grade["correct"] == 2  # the judge still grades against CORRECT IS
+
+
+def test_create_tables_adds_new_columns_to_an_old_table(traces):
+    traces.conn.execute("CREATE TABLE eval_grades (run_id VARCHAR, grader_key VARCHAR)")
+    create_tables(traces)
+    columns = {r[0] for r in traces.conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'eval_grades'").fetchall()}
+    assert {"quick_check", "override", "judge_values"} <= columns
+
+
+def test_serve_runs_run_grade_run_and_override_by_key(tmp_path, traces, data_db):
+    add_run(traces, "q1", None, labels={}, prompt="How many users?", data_source={"db": data_db, "schema": "gold"})
+    traces.close()
+    out = Output()
+    server = Server(None, out, str(tmp_path / "traces.duckdb"), traces_server=False, client=FakeClient())
+    server.handle({"id": "l", "type": "runs", "kind": "single"})
+    server.handle({"id": "g", "type": "grade_run", "run_id": "q1", "quick_check": {"correct": "100 users"}})
+    server.wait_all()
+    key = [m for m in out.messages() if m["id"] == "g"][-1]["grade"]["grader_key"]
+    server.handle({"id": "o", "type": "override", "run_id": "q1", "grader_key": key,
+                   "override": {"correct": 1, "careful": 1, "why": "close"}})
+    server.handle({"id": "r", "type": "run", "run_id": "q1"})
+    server.handle({"id": "bad", "type": "grade_run", "run_id": "q1"})
+    by_id = {}
+    for m in out.messages():
+        by_id.setdefault(m["id"], []).append(m)
+    assert by_id["l"][0]["runs"][0]["run_id"] == "q1"
+    assert [m["type"] for m in by_id["g"]] == ["accepted", "result"]
+    run = by_id["r"][0]
+    assert run["run"]["source"] == {"kind": "db", "dbPath": data_db, "schema": "gold"} and run["run"]["source_recorded"]
+    assert run["grades"][0]["override"]["why"] == "close"
+    assert by_id["bad"][0]["type"] == "error"

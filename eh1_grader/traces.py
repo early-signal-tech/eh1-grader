@@ -48,6 +48,8 @@ class Run:
     cost_usd: float | None
     duration_ms: int | None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # The data the run asked for (agent_runs.data_source), when recorded.
+    data_source: dict | None = None
 
     @property
     def question(self) -> str | None:
@@ -75,18 +77,27 @@ def tool_id(name: str | None) -> str:
     return TOOL_IDS.get(name) or name.lower().replace(" ", "_")
 
 
-def setlist_runs(traces: TracesDB, setlist_run: str) -> list[Run]:
-    """Every run of one setlist (by its ID, the setlist_run label), with its tool calls."""
+def has_column(traces: TracesDB, table: str, column: str) -> bool:
+    return bool(traces.execute(f"""
+        SELECT count(*) FROM information_schema.columns
+        WHERE table_name = {lit(table)} AND column_name = {lit(column)}
+    """).fetchone()[0])
+
+
+def _read_runs(traces: TracesDB, where: str) -> list[Run]:
+    """Runs matching `where` (SQL on agent_runs), oldest first, with their tool calls."""
+    data_source = "data_source::JSON::VARCHAR" if has_column(traces, "agent_runs", "data_source") else "NULL"
     rows = traces.execute(f"""
         SELECT run_id, prompt, coalesce(final_response, ''), status, coalesce(total_iterations, 0),
-               labels::JSON::VARCHAR, source_db, source_schema, estimated_cost_usd, duration_ms
+               labels::JSON::VARCHAR, source_db, source_schema, estimated_cost_usd, duration_ms, {data_source}
         FROM agent_runs
-        WHERE labels.setlist_run::VARCHAR = {lit(setlist_run)}
+        WHERE {where}
         ORDER BY started_at
     """).fetchall()
     runs = [
         Run(run_id=r[0], prompt=r[1] or "", answer=r[2], status=r[3] or "", iterations=r[4],
-            labels=_labels(r[5]), source_db=r[6] or None, source_schema=r[7], cost_usd=r[8], duration_ms=r[9])
+            labels=_labels(r[5]), source_db=r[6] or None, source_schema=r[7], cost_usd=r[8], duration_ms=r[9],
+            data_source=_labels(r[10]) or None)
         for r in rows
     ]
     if not runs:
@@ -101,6 +112,98 @@ def setlist_runs(traces: TracesDB, setlist_run: str) -> list[Run]:
         by_id[run_id].tool_calls.append(
             ToolCall(tool_id(tool), sql, bool(success), error_type, bool(truncated), iteration or 0))
     return runs
+
+
+def setlist_runs(traces: TracesDB, setlist_run: str) -> list[Run]:
+    """Every run of one setlist (by its ID, the setlist_run label), with its tool calls."""
+    return _read_runs(traces, f"labels.setlist_run::VARCHAR = {lit(setlist_run)}")
+
+
+def run_by_id(traces: TracesDB, run_id: str) -> Run | None:
+    runs = _read_runs(traces, f"run_id = {lit(run_id)}")
+    return runs[0] if runs else None
+
+
+def source_spec(run: Run) -> dict | None:
+    """The run's data as a question set source ({kind: tpch | db | files}), so reference
+    SQL can run on it: from data_source when the agent recorded it, else from the
+    database path DuckDB reported (None for in-memory data from older runs)."""
+    d = run.data_source or {}
+    if d.get("tpch") is not None:
+        return {"kind": "tpch", "tpchScale": d["tpch"]}
+    if d.get("load"):
+        return {"kind": "files", "files": list(d["load"])}
+    if d.get("db"):
+        return {"kind": "db", "dbPath": d["db"], **({"schema": d["schema"]} if d.get("schema") else {})}
+    if run.source_db:
+        schema = run.source_schema if run.source_schema and run.source_schema != "main" else None
+        return {"kind": "db", "dbPath": run.source_db, **({"schema": schema} if schema else {})}
+    return None
+
+
+def run_detail(traces: TracesDB, run_id: str) -> dict | None:
+    """One run as RUN mode shows it: question, answer, how it ended, its preset, model,
+    labels, data, and a summary of its tool calls."""
+    run = run_by_id(traces, run_id)
+    if run is None:
+        return None
+    started, preset, config, model = traces.execute(f"""
+        SELECT started_at, preset::JSON::VARCHAR, config::JSON::VARCHAR, model FROM agent_runs WHERE run_id = {lit(run_id)}
+    """).fetchone()
+    config = _labels(config)
+    return {
+        "run_id": run.run_id, "started_at": started.isoformat() if started else None, "prompt": run.prompt,
+        "answer": run.answer, "status": run.status, "iterations": run.iterations, "labels": run.labels,
+        "preset": _labels(preset) or None, "model": model, "effort": config.get("effort"),
+        "cost_usd": run.cost_usd, "duration_ms": run.duration_ms, "source": source_spec(run),
+        "source_recorded": run.data_source is not None,
+        "tool_calls": len(run.tool_calls), "failed_calls": sum(not c.success for c in run.tool_calls),
+    }
+
+
+RUN_KINDS = {
+    "all": "true",
+    "single": "r.labels.setlist_run IS NULL AND r.labels.pair IS NULL",
+    "ab": "r.labels.pair IS NOT NULL",
+    "setlist": "r.labels.setlist_run IS NOT NULL",
+}
+
+
+def list_runs(traces: TracesDB, kind: str = "all", search: str = "", limit: int = 100) -> list[dict]:
+    """Recent runs, newest first: what they asked, how they ended, their preset and labels,
+    and their newest grade (any grader setting, yours where you overrode it)."""
+    if kind not in RUN_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(RUN_KINDS)}")
+    where = [RUN_KINDS[kind]]
+    for word in search.split():
+        pattern = lit(f"%{word}%")
+        where.append(f"(r.prompt ILIKE {pattern} OR r.run_id ILIKE {pattern} OR r.preset.name::VARCHAR ILIKE {pattern}"
+                     f" OR r.labels.question::VARCHAR ILIKE {pattern} OR r.labels.setlist_name::VARCHAR ILIKE {pattern})")
+    rows = traces.execute(f"""
+        WITH g AS (
+            SELECT run_id, question_set, question,
+                   coalesce(override.correct::INTEGER, correct) + coalesce(override.careful::INTEGER, careful) + efficient AS total,
+                   rules_passed,
+                   row_number() OVER (PARTITION BY run_id ORDER BY graded_at DESC) AS n
+            FROM eval_grades
+        )
+        SELECT r.run_id, r.started_at, left(r.prompt, 300), r.status, r.preset.name::VARCHAR, r.preset.modified::BOOLEAN,
+               r.labels::JSON::VARCHAR, r.estimated_cost_usd, g.question_set, g.question, g.total, g.rules_passed
+        FROM agent_runs r LEFT JOIN g ON g.run_id = r.run_id AND g.n = 1
+        WHERE {" AND ".join(where)}
+        ORDER BY r.started_at DESC
+        LIMIT {int(limit)}
+    """).fetchall()
+    out = []
+    for run_id, started, prompt, status, preset, modified, labels, cost, qset, question, total, rules_passed in rows:
+        out.append({
+            "run_id": run_id, "started_at": started.isoformat() if started else None, "prompt": prompt or "",
+            "status": status, "preset": preset, "preset_modified": bool(modified), "labels": _labels(labels),
+            "cost_usd": cost,
+            "grade": None if qset is None else {"question_set": qset, "question": question, "total": total,
+                                                 "rules_passed": rules_passed},
+        })
+    return out
 
 
 def list_setlists(traces: TracesDB) -> list[dict]:
@@ -250,6 +353,9 @@ EVAL_GRADES = {
     "judge_error": "VARCHAR",
     # A person's correction, kept next to the judge's scores: {correct, careful, why, at}.
     "override": "VARIANT",
+    # A quick check (RUN mode, no question set): {correct, careful, sql, source}. Its
+    # grades have question_set 'quick' and no question.
+    "quick_check": "VARIANT",
 }
 
 
@@ -259,19 +365,28 @@ def create_tables(traces: TracesDB) -> None:
     tables = {"eval_grades": EVAL_GRADES, "eval_setlists": EVAL_SETLISTS}
     ddl = {name: f"CREATE TABLE IF NOT EXISTS {name} (" + ", ".join(f'"{c}" {t}' for c, t in columns.items()) + ")"
            for name, columns in tables.items()}
-    if not traces.remote:
-        for sql in ddl.values():
-            traces.conn.execute(sql)
-        return
-    run = lambda sql: traces.conn.execute(  # noqa: E731
-        "SELECT * FROM quack_query(?, ?, token = ?)", [traces.quack_uri, sql, traces._token]).fetchall()
+    if traces.remote:
+        run = lambda sql: traces.conn.execute(  # noqa: E731
+            "SELECT * FROM quack_query(?, ?, token = ?)", [traces.quack_uri, sql, traces._token]).fetchall()
+    else:
+        run = lambda sql: traces.conn.execute(sql).fetchall()  # noqa: E731
     names = ", ".join(lit(n) for n in tables)
-    existing = {r[0] for r in run(f"SELECT table_name FROM information_schema.tables WHERE table_name IN ({names})")}
-    missing = [n for n in tables if n not in existing]
-    if not missing:
+    have: dict[str, set[str]] = {}
+    for table, column in run(f"SELECT table_name, column_name FROM information_schema.columns WHERE table_name IN ({names})"):
+        have.setdefault(table, set()).add(column)
+    changed = False
+    for name, columns in tables.items():
+        if name not in have:
+            run(ddl[name])
+            changed = True
+            continue
+        # Columns added since the table was made (e.g. quick_check).
+        for column, spec in columns.items():
+            if column not in have[name]:
+                run(f'ALTER TABLE {name} ADD COLUMN "{column}" {spec}')
+                changed = True
+    if not changed or not traces.remote:
         return
-    for name in missing:
-        run(ddl[name])
     # The attached catalog lists the server's tables as of attaching: attach again so
     # this connection sees the new tables.
     traces.conn.execute("USE memory")
@@ -326,6 +441,33 @@ def set_override(traces: TracesDB, run_id: str, grader_key: str, override: dict 
     value = "NULL" if override is None else f"{lit(json.dumps(override, default=str))}::JSON::VARIANT"
     traces.execute(f"UPDATE eval_grades SET override = {value} WHERE {where}")
     return True
+
+
+def run_grades(traces: TracesDB, run_id: str) -> list[dict]:
+    """Every grade of one run (all grader settings, quick checks too), newest first."""
+    rows = traces.execute(f"""
+        SELECT g.run_id, g.grader_key, g.graded_at, g.question_set, g.question_set_revision, g.question,
+               g.grader::JSON::VARCHAR, g.quick_check::JSON::VARCHAR, r.status,
+               g.correct, g.careful, g.efficient, g.correct_reason, g.careful_reason, g.efficient_reason,
+               g.judge_unsure, g.judge_values::JSON::VARCHAR, g.rules::JSON::VARCHAR, g.rules_passed,
+               g.judge_model, g.judge_cost_usd, g.judge_error, g.override::JSON::VARCHAR, r.estimated_cost_usd,
+               g.reference::JSON::VARCHAR
+        FROM eval_grades g JOIN agent_runs r USING (run_id)
+        WHERE g.run_id = {lit(run_id)}
+        ORDER BY g.graded_at DESC
+    """).fetchall()
+    keys = ["run_id", "grader_key", "graded_at", "question_set", "question_set_revision", "question", "grader",
+            "quick_check", "status", "correct", "careful", "efficient", "correct_reason", "careful_reason",
+            "efficient_reason", "judge_unsure", "judge_values", "rules", "rules_passed", "judge_model",
+            "judge_cost_usd", "judge_error", "override", "run_cost_usd", "reference"]
+    out = []
+    for row in rows:
+        item = dict(zip(keys, row))
+        item["graded_at"] = item["graded_at"].isoformat() if item["graded_at"] else None
+        for k in ("grader", "quick_check", "judge_values", "rules", "override", "reference"):
+            item[k] = json.loads(item[k]) if item[k] else None
+        out.append(item)
+    return out
 
 
 def graded_run_ids(traces: TracesDB, setlist_run: str, grader_key: str) -> set[str]:

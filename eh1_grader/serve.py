@@ -30,6 +30,19 @@ Requests (each has an "id" and a "type"; every message names its request's "id")
         (null clears it; regrading keeps it)
     {"type": "stop", "grade": "<id of a grade request>"}  -> {"type": "ok"}
 "grade" also takes "run_ids": [...] to grade just those runs again (one scorecard cell).
+"override" takes "grader_key" in place of "question_set" + "grader" (for quick checks).
+
+RUN mode, one run at a time:
+    {"type": "runs", "kind": "all" | "single" | "ab" | "setlist", "search": "…", "limit": 100}
+        -> {"type": "runs", "runs": [{run_id, started_at, prompt, status, preset, labels,
+            cost_usd, grade: {question_set, question, total, rules_passed} | null}, ...]}
+    {"type": "run", "run_id": "…"}
+        -> {"type": "run", "run": {run_id, prompt, answer, status, labels, preset, model,
+            source, ...}, "grades": [every grade of it, newest first]}
+    {"type": "grade_run", "run_id": "…", "grader": {...},
+     "question_set": {...}, "question": "Q3"}            (against a question)
+     or "quick_check": {"correct": "…", "careful": "…", "sql": ["…"]}   (against your check)
+        -> {"type": "accepted"}, then {"type": "result", "grade": {...}}
 Errors come back as {"type": "error", "error": "..."}. End of input stops and exits.
 """
 
@@ -45,11 +58,11 @@ from dotenv import load_dotenv
 from duckdb_agent import connect_traces_db
 from duckdb_agent.config import API_MAX_RETRIES
 
-from .grade import GraderSettings, check_question_set, grade_setlist, grader_key
+from .grade import GraderSettings, check_question_set, grade_one, grade_setlist, grader_key
 from .judge import JUDGE_PRICING
 from .traces import (
-    MAX_NAME, MAX_NOTE, clean_text, create_tables, grading_status, list_setlists, read_grades, rename_setlist,
-    set_override, setlist_exists,
+    MAX_NAME, MAX_NOTE, clean_text, create_tables, grading_status, list_runs, list_setlists, read_grades, rename_setlist,
+    run_detail, run_grades, set_override, setlist_exists,
 )
 
 PROTOCOL_VERSION = 1
@@ -107,6 +120,28 @@ class Server:
                 self.setlists(rid, request)
             elif kind == "rename":
                 self.rename(rid, request)
+            elif kind == "runs":
+                traces = self.traces()
+                try:
+                    create_tables(traces)
+                    runs = list_runs(traces, str(request.get("kind") or "all"), str(request.get("search") or ""),
+                                     min(500, int(request.get("limit") or 100)))
+                finally:
+                    traces.close()
+                self.send({"id": rid, "type": "runs", "runs": runs})
+            elif kind == "run":
+                traces = self.traces()
+                try:
+                    create_tables(traces)
+                    run = run_detail(traces, str(request.get("run_id") or ""))
+                    if run is None:
+                        raise ValueError(f"no run {request.get('run_id')!r} in the traces")
+                    grades = run_grades(traces, run["run_id"])
+                finally:
+                    traces.close()
+                self.send({"id": rid, "type": "run", "run": run, "grades": grades})
+            elif kind == "grade_run":
+                self.start_grade_run(rid, request)
             elif kind == "grades":
                 question_set = request.get("question_set") or {}
                 check_question_set(question_set)
@@ -174,9 +209,12 @@ class Server:
 
     def override(self, rid: str, request: dict) -> None:
         """Your CORRECT and CAREFUL for one graded run, kept next to the judge's."""
-        question_set = request.get("question_set") or {}
-        check_question_set(question_set)
-        key = grader_key(GraderSettings.from_dict(request.get("grader")), question_set)
+        if isinstance(request.get("grader_key"), str) and request["grader_key"]:
+            key = request["grader_key"]
+        else:
+            question_set = request.get("question_set") or {}
+            check_question_set(question_set)
+            key = grader_key(GraderSettings.from_dict(request.get("grader")), question_set)
         value = request.get("override")
         if value is not None:
             if not isinstance(value, dict):
@@ -194,6 +232,37 @@ class Server:
         finally:
             traces.close()
         self.send({"id": rid, "type": "ok"})
+
+    def start_grade_run(self, rid: str, request: dict) -> None:
+        """Grade one run in the background (the judge takes a few seconds)."""
+        run_id = request.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError('"run_id" must be a run ID')
+        question_set = request.get("question_set")
+        if question_set is None and request.get("quick_check") is None:
+            raise ValueError('grade_run needs "question_set" and "question", or "quick_check"')
+
+        def work():
+            traces = None
+            try:
+                traces = self.traces()
+                grade = grade_one(traces, run_id, GraderSettings.from_dict(request.get("grader")), self.client,
+                                  question_set=question_set, question_id=request.get("question"),
+                                  quick_check=request.get("quick_check"))
+                self.send({"id": rid, "type": "result", "grade": grade})
+            except Exception as e:
+                self.error(rid, f"{type(e).__name__}: {e}")
+            finally:
+                if traces is not None:
+                    traces.close()
+                with self._jobs_lock:
+                    self._jobs.pop(rid, None)
+
+        thread = threading.Thread(target=work, name=f"grade-run-{rid}", daemon=True)
+        with self._jobs_lock:
+            self._jobs[rid] = {"thread": thread, "cancel": threading.Event()}
+        self.send({"id": rid, "type": "accepted"})
+        thread.start()
 
     def start_grade(self, rid: str, request: dict) -> None:
         question_set = request.get("question_set") or {}
