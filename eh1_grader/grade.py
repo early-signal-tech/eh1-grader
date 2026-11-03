@@ -1,4 +1,5 @@
-"""Grading a setlist: every run, against its question, under one grader setting.
+"""Grading a setlist: every run, against its question, under one grader setting. And
+grading one run (RUN mode): against a question, or a quick check you write for it.
 
 For each run: the trace rules and EFFICIENT come from its traces; CORRECT and CAREFUL
 from the judge (only when the question has a check). Each grade is written to
@@ -21,7 +22,7 @@ from .efficiency import DEFAULT_ITERATION_BUDGET, efficiency
 from .judge import DEFAULT_JUDGE_EFFORT, DEFAULT_JUDGE_MODEL, JUDGE_VERSION, judge
 from .reference import References
 from .rules import check_rules
-from .traces import Run, create_tables, graded_run_ids, setlist_runs, write_grade
+from .traces import Run, create_tables, graded_run_ids, run_by_id, run_grades, setlist_runs, source_spec, write_grade
 
 SUPPORTED_FORMAT_VERSION = 2
 
@@ -183,3 +184,70 @@ def grade_setlist(
         references.close()
     summary.cancelled = cancel.is_set()
     return summary
+
+
+QUICK_SET = "quick"
+
+
+def quick_key(settings: GraderSettings, check: dict, source: dict | None) -> str:
+    """A quick check's grades are kept per grader setting and per check: change the check
+    and it's a new grade, beside the old one."""
+    content = hashlib.sha1(json.dumps({"check": check, "source": source}, sort_keys=True).encode()).hexdigest()[:10]
+    return grader_key(settings, {"id": f"{QUICK_SET}:{content}", "revision": 1})
+
+
+def clean_quick_check(check: dict | None) -> dict:
+    """{correct, careful?, sql: [...]} from what the app sent; CORRECT IS is required."""
+    check = check if isinstance(check, dict) else {}
+    correct = str(check.get("correct") or "").strip()
+    if not correct:
+        raise ValueError('a quick check needs "correct": what a correct answer says')
+    sql = check.get("sql") or []
+    sql = [sql] if isinstance(sql, str) else sql
+    sql = [str(q).strip() for q in sql if str(q).strip()]
+    careful = str(check.get("careful") or "").strip()
+    return {"correct": correct, **({"careful": careful} if careful else {}), **({"sql": sql} if sql else {})}
+
+
+def grade_one(
+    traces: TracesDB,
+    run_id: str,
+    settings: GraderSettings | None = None,
+    client: anthropic.Anthropic | None = None,
+    question_set: dict | None = None,
+    question_id: str | None = None,
+    quick_check: dict | None = None,
+) -> dict:
+    """Grade one run, against a question of `question_set` or against `quick_check`
+    ({correct, careful, sql}; reference SQL runs on the run's own data). Writes the grade
+    (keeping any override) and returns it as run_grades shows it."""
+    settings = settings or GraderSettings()
+    create_tables(traces)
+    run = run_by_id(traces, run_id)
+    if run is None:
+        raise ValueError(f"no run {run_id!r} in the traces")
+    if question_set is not None:
+        check_question_set(question_set)
+        question = next((q for q in question_set["questions"] if q.get("id") == question_id), None)
+        if question is None:
+            raise ValueError(f"no question {question_id!r} in {question_set['id']}")
+        key = grader_key(settings, question_set)
+        extra = {}
+    else:
+        check = clean_quick_check(quick_check)
+        source = source_spec(run)
+        key = quick_key(settings, check, source)
+        question = {"id": None, "prompt": run.prompt, "check": check}
+        question_set = {"id": QUICK_SET, "revision": None, "source": source, "questions": [question]}
+        extra = {"quick_check": {**check, "source": source}}
+    references = References()
+    try:
+        row = grade_run(run, question, question_set, settings, key, references, client)
+    finally:
+        references.close()
+    if question_set["id"] == QUICK_SET and not question_set["source"] and quick_check and question["check"].get("sql"):
+        row["reference"] = [{"sql": q, "rows": None, "columns": None, "preview": None,
+                             "error": "This run didn't record its data (runs before the agent kept data_source)."}
+                            for q in question["check"]["sql"]]
+    write_grade(traces, {**row, **extra})
+    return next(g for g in run_grades(traces, run_id) if g["grader_key"] == key)

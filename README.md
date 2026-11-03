@@ -38,6 +38,19 @@ Rename a setlist in EH-1 and your name and note go in `eval_setlists` (one row p
 setlist), never into the agent's run labels. They win over the name DH-1 labelled the
 runs with. Clear them and DH-1's name, or the suggested title, shows again.
 
+## One run (RUN mode)
+
+EH-1 can grade a single run, against a question or a **quick check** you write for it:
+- **A question:** the one its setlist labels name, the same prompt in a set, or one you
+  pick. This uses the same grader key as grading the setlist, so the scorecard sees it.
+- **A quick check:** CORRECT IS, plus optional reference SQL and CAREFUL MEANS. Its grades
+  have `question_set = 'quick'` and keep the check in `eval_grades.quick_check`. A
+  changed check is a new grade beside the old one.
+
+Reference SQL runs on the run's own data. That's `agent_runs.data_source` when the agent
+recorded it (newer runs). Otherwise it's the database path the run reported, and runs on
+in-memory data from before then can't run it.
+
 ## Overrides
 
 When you disagree with the judge, set your own CORRECT and CAREFUL (0–2) and a reason.
