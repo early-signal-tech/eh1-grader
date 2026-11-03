@@ -478,3 +478,47 @@ def test_serve_runs_run_grade_run_and_override_by_key(tmp_path, traces, data_db)
     assert run["run"]["source"] == {"kind": "db", "dbPath": data_db, "schema": "gold"} and run["run"]["source_recorded"]
     assert run["grades"][0]["override"]["why"] == "close"
     assert by_id["bad"][0]["type"] == "error"
+
+
+# --- the rubric and Efficient settings ---
+
+def test_later_settings_leave_old_keys_alone(question_set):
+    base = grader_key(GraderSettings(), question_set)
+    # The key a grade got before instructions and waste_for_one existed.
+    import hashlib
+    from dataclasses import asdict
+    from eh1_grader.judge import JUDGE_VERSION
+    old = {k: v for k, v in asdict(GraderSettings()).items() if k not in ("instructions", "waste_for_one")}
+    payload = {"grader": old, "set": "mini", "revision": 1, "judge": JUDGE_VERSION}
+    assert base == hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
+    assert grader_key(GraderSettings(instructions="Be lenient on rounding."), question_set) != base
+    assert grader_key(GraderSettings(waste_for_one=1), question_set) != base
+
+
+def test_settings_are_cleaned():
+    s = GraderSettings.from_dict({"instructions": "  x " * 2000, "iteration_budget": 999, "waste_for_one": -3, "nope": 1})
+    assert len(s.instructions) <= 2000 and s.iteration_budget == 50 and s.waste_for_one == 0
+
+
+def test_instructions_go_to_the_judge(traces, question_set):
+    add_run(traces, "r1", "A1")
+    client = FakeClient()
+    grade_setlist(traces, question_set, "sl-1", settings=GraderSettings(instructions="Ignore currency symbols."), client=client)
+    assert "<grader_notes>\nIgnore currency symbols.\n</grader_notes>" in client.calls[0]["messages"][0]["content"]
+    client = FakeClient()
+    grade_setlist(traces, question_set, "sl-1", client=client, regrade=True)
+    assert "grader_notes" not in client.calls[0]["messages"][0]["content"]
+
+
+def test_waste_for_one():
+    run = run_of([call("query_database", f"SELECT {n}", success=False) for n in range(3)])
+    assert efficiency(run)[0] == 0
+    assert efficiency(run, waste_for_one=3)[0] == 1
+
+
+def test_hello_has_the_scale(tmp_path):
+    out = Output()
+    Server(None, out, str(tmp_path / "t.duckdb"), traces_server=False).handle({"id": "h", "type": "hello"})
+    hello = out.messages()[0]
+    assert [s["score"] for s in hello["scale"]] == ["CORRECT", "CAREFUL", "EFFICIENT"]
+    assert hello["defaults"]["waste_for_one"] == 2 and hello["defaults"]["instructions"] == ""

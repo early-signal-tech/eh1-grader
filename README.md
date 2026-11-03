@@ -80,8 +80,21 @@ output (a JSON schema), since Sonnet 5.5 and Opus 5.5 reject a forced tool choic
 - Otherwise the **waste** is counted: failed tool calls, repeated identical queries, and
   truncated results after the first.
 - **2:** no waste, and within budget.
-- **1:** at most two pieces of waste.
+- **1:** at most two pieces of waste (`waste_for_one`, set in EH-1's Efficient flyout).
 - **0:** more waste than that.
+
+## Grader settings
+
+A grade belongs to its grader settings:
+- judge model, effort, and tolerance
+- iteration budget and `waste_for_one`
+- `instructions`: your own notes, sent to the judge with every question (EH-1's Rubric
+  flyout)
+
+Together with the question set's id and revision, these make the `grader_key`.
+`instructions` and `waste_for_one` were added after grades already existed, so they stay
+out of the key while at their defaults, and those grades keep their keys. `hello` sends
+the scale (`scale`) for the app to show.
 
 ## Code
 

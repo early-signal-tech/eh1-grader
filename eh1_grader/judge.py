@@ -29,6 +29,18 @@ JUDGE_PRICING = {
     "claude-opus-5-5": {"input": 4.0, "output": 20.0},
 }
 
+# The scale, as SYSTEM states it, for the app's Rubric flyout. (EFFICIENT is scored from
+# the traces, see efficiency.py.)
+SCALE = [
+    {"score": "CORRECT", "2": "Numbers and claims match the reference (within the tolerance)",
+     "1": "Right approach, minor errors or omissions", "0": "Wrong or invented numbers, or a different question"},
+    {"score": "CAREFUL", "2": "States its assumptions and flags the data issues that matter",
+     "1": "Some of them", "0": "Overclaims, or misses an obvious issue"},
+    {"score": "EFFICIENT", "2": "Within the iteration budget, no waste", "1": "A little waste",
+     "0": "A limit, over twice the budget, or a lot of waste"},
+]
+MAX_INSTRUCTIONS = 2000
+
 SCORE = {"type": "integer", "enum": [0, 1, 2]}
 
 SCHEMA = {
@@ -79,6 +91,7 @@ of truth for numbers.
 - "fail": if the answer does this, score CORRECT 0 (and CAREFUL 0 if it's about care).
 - "bonus" can lift CAREFUL to 2; it never changes CORRECT.
 - "note" is context for you (e.g. a known gap); follow it.
+- <grader_notes>, when present, are the grader's own instructions for every question; follow them.
 - When the right answer is that the data can't answer the question, an answer that says so \
 clearly is correct.
 
@@ -120,13 +133,17 @@ def estimate_cost(model: str, usage) -> float | None:
     return (prompt * rates["input"] + (getattr(usage, "output_tokens", 0) or 0) * rates["output"]) / 1_000_000
 
 
-def build_prompt(question: dict, check: dict, references: list[dict], answer: str, tolerance: str) -> str:
+def build_prompt(question: dict, check: dict, references: list[dict], answer: str, tolerance: str,
+                 instructions: str = "") -> str:
     notes = {k: check[k] for k in ("reference", "correct", "careful", "fail", "bonus", "note") if check.get(k)}
     parts = [
         "<question>\n" + question["prompt"] + "\n</question>",
         "<criteria>\n" + json.dumps(notes, indent=2, ensure_ascii=False) + "\n</criteria>",
         f"<tolerance>Numbers within {tolerance} of the reference count as matching; rounding is fine.</tolerance>",
     ]
+    if instructions.strip():
+        # The person's own notes for every question (the Rubric flyout's ALSO TELL THE JUDGE).
+        parts.append("<grader_notes>\n" + instructions.strip() + "\n</grader_notes>")
     for i, ref in enumerate(references, 1):
         body = ref["preview"] if ref["error"] is None else f"(the reference query failed: {ref['error']})"
         parts.append(f'<reference_query n="{i}">\n{ref["sql"]}\n</reference_query>\n'
@@ -137,14 +154,15 @@ def build_prompt(question: dict, check: dict, references: list[dict], answer: st
 
 
 def judge(client: anthropic.Anthropic, question: dict, check: dict, references: list[dict], answer: str,
-          model: str = DEFAULT_JUDGE_MODEL, effort: str = DEFAULT_JUDGE_EFFORT, tolerance: str = "±0.5%") -> Verdict:
+          model: str = DEFAULT_JUDGE_MODEL, effort: str = DEFAULT_JUDGE_EFFORT, tolerance: str = "±0.5%",
+          instructions: str = "") -> Verdict:
     """Score one answer. API or parsing failures come back as a Verdict with `error` set."""
     try:
         response = client.messages.create(
             model=model,
             max_tokens=JUDGE_MAX_TOKENS,
             system=SYSTEM,
-            messages=[{"role": "user", "content": build_prompt(question, check, references, answer, tolerance)}],
+            messages=[{"role": "user", "content": build_prompt(question, check, references, answer, tolerance, instructions)}],
             output_config={"effort": effort, "format": {"type": "json_schema", "schema": SCHEMA}},
         )
     except anthropic.APIError as e:
