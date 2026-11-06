@@ -5,8 +5,12 @@ duck-harness-serve.
 
 Requests (each has an "id" and a "type"; every message names its request's "id"):
     {"type": "hello"}
-        -> {"type": "hello", "protocol": 1, "defaults": {...GraderSettings}, "judge_models": [...],
+        -> {"type": "hello", "protocol": 1, "version": "0.1.0", "traces_schema": "…",
+            "grades_schema": "…", "defaults": {...GraderSettings}, "judge_models": [...],
             "scale": [{score, "2", "1", "0"}, ...]}  (the rubric, for the app to show)
+        "version" is eh1-grader's; "traces_schema" is the agent traces schema it reads (from
+        the duck-harness package it was built with), which must match the agent's;
+        "grades_schema" names EH-1's own tables (eval_grades, eval_setlists).
     {"type": "setlists", "grader": {...}, "question_sets": [{"id", "revision"}, ...]}
         -> {"type": "setlists", "setlists": [{id, name, note, question_set, revision, runs,
             completed, cancelled, columns, repeats, concurrency, cost_usd, started_at, ended_at,
@@ -56,17 +60,27 @@ from datetime import datetime
 
 import anthropic
 from dotenv import load_dotenv
-from duckdb_agent import connect_traces_db
+from importlib.metadata import PackageNotFoundError, version
+
+from duckdb_agent import SCHEMA_VERSION, connect_traces_db
 from duckdb_agent.config import API_MAX_RETRIES
 
 from .grade import GraderSettings, check_question_set, grade_one, grade_setlist, grader_key
 from .judge import JUDGE_PRICING, SCALE
 from .traces import (
-    MAX_NAME, MAX_NOTE, clean_text, create_tables, grading_status, list_runs, list_setlists, read_grades, rename_setlist,
+    GRADES_SCHEMA, MAX_NAME, MAX_NOTE, clean_text, create_tables, grading_status, list_runs, list_setlists, read_grades, rename_setlist,
     run_detail, run_grades, set_override, setlist_exists,
 )
 
 PROTOCOL_VERSION = 1
+
+
+def grader_version() -> str:
+    """The installed eh1-grader version, as hello reports it."""
+    try:
+        return version("eh1-grader")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 def grading_revision(setlist: dict, sets: list[dict]) -> int:
@@ -115,6 +129,8 @@ class Server:
         try:
             if kind == "hello":
                 self.send({"id": rid, "type": "hello", "protocol": PROTOCOL_VERSION,
+                           "version": grader_version(), "traces_schema": SCHEMA_VERSION,
+                           "grades_schema": GRADES_SCHEMA,
                            "defaults": dataclasses.asdict(GraderSettings()),
                            "judge_models": ["claude-haiku-5-5", *JUDGE_PRICING], "scale": SCALE})
             elif kind == "setlists":

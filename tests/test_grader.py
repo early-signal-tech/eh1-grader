@@ -522,3 +522,14 @@ def test_hello_has_the_scale(tmp_path):
     hello = out.messages()[0]
     assert [s["score"] for s in hello["scale"]] == ["CORRECT", "CAREFUL", "EFFICIENT"]
     assert hello["defaults"]["waste_for_one"] == 2 and hello["defaults"]["instructions"] == ""
+
+
+def test_hello_reports_versions(tmp_path):
+    from duckdb_agent import SCHEMA_VERSION
+    from eh1_grader.traces import GRADES_SCHEMA
+    out = Output()
+    Server(None, out, str(tmp_path / "t.duckdb"), traces_server=False).handle({"id": "h", "type": "hello"})
+    hello = out.messages()[0]
+    assert hello["version"] not in ("", "unknown")
+    assert hello["traces_schema"] == SCHEMA_VERSION  # the agent's, from the package it was built with
+    assert hello["grades_schema"] == GRADES_SCHEMA and len(GRADES_SCHEMA) == 12

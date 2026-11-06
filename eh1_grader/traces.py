@@ -7,6 +7,7 @@ runs write. Quack doesn't forward query parameters, so values go into the SQL as
 escaped literals (see `lit`).
 """
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 
@@ -357,6 +358,11 @@ EVAL_GRADES = {
     # grades have question_set 'quick' and no question.
     "quick_check": "VARIANT",
 }
+
+
+# Changes whenever EH-1's tables do, like the agent's traces SCHEMA_VERSION. The grader
+# reports it in hello, so the app can tell two graders that write different tables apart.
+GRADES_SCHEMA = hashlib.sha256((repr(EVAL_GRADES) + repr(EVAL_SETLISTS)).encode()).hexdigest()[:12]
 
 
 def create_tables(traces: TracesDB) -> None:

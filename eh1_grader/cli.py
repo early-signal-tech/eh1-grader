@@ -16,7 +16,7 @@ from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
-from duckdb_agent import connect_traces_db
+from duckdb_agent import TracesServerOutdated, connect_traces_db
 from duckdb_agent.config import API_MAX_RETRIES
 
 from .grade import GraderSettings, grade_setlist
@@ -72,7 +72,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     load_dotenv()
 
-    traces = connect_traces_db(args.traces_db)
+    try:
+        traces = connect_traces_db(args.traces_db)
+    except TracesServerOutdated as e:
+        print(f"Traces unavailable: {e}", file=sys.stderr)
+        return 1
     try:
         if args.list:
             create_tables(traces)
