@@ -68,11 +68,20 @@ uv sync
 uv run eh1-grade --list                                    # setlists in the traces
 uv run eh1-grade --setlist sl-2026-11-02-1819-4vtm \
     --set ../duckdb-analytics-agent/evals/analytics-eval.json
+uv run eh1-grade --follow --set tpch.json --set ../duckdb-analytics-agent/evals/analytics-eval.json
 uv run eh1-serve --traces-db ../duckdb-analytics-agent/agent_traces.duckdb   # for the app
 ```
 
-The judge defaults to `claude-sonnet-5-5` at low effort. It answers with structured
-output (a JSON schema), since Sonnet 5.5 and Opus 5.5 reject a forced tool choice.
+`--follow` keeps running and grades each setlist run as it finishes, for setlists that
+play after it starts (one already playing is picked up whole), until Ctrl+C. Give it
+every question set the setlists might use; a setlist whose set isn't given is skipped.
+Only setlists are followed: single runs and A/B compares are graded when you ask. The
+rack's AUTO-GRADE is the same thing, through the `follow` request (follow.py).
+
+The judge defaults to `claude-haiku-5-5` at low effort (about a tenth of a cent a run,
+so following a setlist stays cheap); `--judge-model claude-sonnet-5-5` or Opus for a
+closer read. It answers with structured output (a JSON schema), since Sonnet 5.5 and
+Opus 5.5 reject a forced tool choice.
 
 ## How EFFICIENT is scored
 
@@ -106,6 +115,7 @@ eh1_grader/
   reference.py   reference SQL on the run's data (read-only, cached)
   judge.py       CORRECT and CAREFUL (structured output)
   grade.py       grading a setlist: what to grade, in parallel, written as it goes
+  follow.py      following DH-1: grading setlist runs as they finish (--follow, AUTO-GRADE)
   serve.py       the app protocol (JSON Lines)
   cli.py         eh1-grade
 ```

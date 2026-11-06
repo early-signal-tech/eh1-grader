@@ -4,6 +4,11 @@
     uv run eh1-grade --setlist sl-2026-11-02-1819-4vtm \\
         --set ../duckdb-analytics-agent/evals/analytics-eval.json
     uv run eh1-grade --setlist … --set … --judge-model claude-haiku-5-5 --regrade
+    uv run eh1-grade --follow --set tpch.json --set mine.json   # grade setlists as they play
+
+--follow grades each setlist run as it finishes, for setlists that run after it starts
+(the rack's AUTO-GRADE does the same), until Ctrl+C. Give every question set the setlists
+might use; a setlist whose set isn't given is skipped.
 
 The traces are the agent's (--traces-db, default: the agent checkout next to this one).
 """
@@ -19,6 +24,7 @@ from dotenv import load_dotenv
 from duckdb_agent import TracesServerOutdated, connect_traces_db
 from duckdb_agent.config import API_MAX_RETRIES
 
+from .follow import Follower
 from .grade import GraderSettings, grade_setlist
 from .traces import create_tables, list_setlists, read_grades
 
@@ -59,12 +65,43 @@ def scorecard(grades: list[dict], question_set: dict) -> str:
     return "\n".join(lines)
 
 
+def follow(traces, sets: list[dict], settings: GraderSettings, args) -> int:
+    """Grade setlist runs as they finish, printing each grade, until Ctrl+C."""
+    def progress(event):
+        kind = event["event"]
+        if kind == "follow_start":
+            print(f"Following: grading setlist runs as they finish ({', '.join(s['id'] for s in sets)}). "
+                  "Ctrl+C stops.", file=sys.stderr)
+        elif kind == "graded":
+            scores = f"{event['correct']} {event['careful']} {event['efficient']}"
+            print(f"  {event['setlist_run']}  {event['question']:<5} {event['column']}#{event['repeat']}  {scores}",
+                  file=sys.stderr)
+        elif kind == "grade_error":
+            print(f"  ! {event['error']}", file=sys.stderr)
+        elif kind == "follow_skipped":
+            print(f"  skipped {event['setlist_run']}: {event['reason']}", file=sys.stderr)
+
+    follower = Follower(traces, sets, settings, anthropic.Anthropic(max_retries=API_MAX_RETRIES),
+                        on_event=progress, concurrency=args.concurrency)
+    try:
+        follower.run(args.interval)
+    except KeyboardInterrupt:
+        follower.cancel.set()
+    totals = follower.totals
+    print(f"Graded {totals.graded}, judge cost ${totals.judge_cost_usd:.4f}", file=sys.stderr)
+    return 1 if totals.errors else 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Grade a setlist's runs and print the scorecard.")
     parser.add_argument("--traces-db", default=DEFAULT_TRACES)
     parser.add_argument("--list", action="store_true", help="List the setlists in the traces and exit.")
     parser.add_argument("--setlist", help="The setlist ID (sl-…).")
-    parser.add_argument("--set", help="The question set file the setlist ran.")
+    parser.add_argument("--set", action="append", default=[],
+                        help="The question set file the setlist ran (repeat it with --follow for several).")
+    parser.add_argument("--follow", action="store_true",
+                        help="Keep running: grade setlist runs as they finish, until Ctrl+C.")
+    parser.add_argument("--interval", type=float, default=5.0, help="With --follow: seconds between checks.")
     parser.add_argument("--judge-model", default=GraderSettings.judge_model)
     parser.add_argument("--judge-effort", default=GraderSettings.judge_effort)
     parser.add_argument("--concurrency", type=int, default=4)
@@ -84,10 +121,14 @@ def main(argv=None) -> int:
                 print(f"{s['id']}  {s['question_set']} r{s['revision']}  {s['runs']} runs  "
                       f"{s['name'] or ''}  {s['started_at']}")
             return 0
-        if not args.setlist or not args.set:
-            parser.error("--setlist and --set are needed (or --list)")
-        question_set = json.loads(Path(args.set).read_text())
         settings = GraderSettings(judge_model=args.judge_model, judge_effort=args.judge_effort)
+        if args.follow:
+            if not args.set:
+                parser.error("--follow needs at least one --set")
+            return follow(traces, [json.loads(Path(p).read_text()) for p in args.set], settings, args)
+        if not args.setlist or len(args.set) != 1:
+            parser.error("--setlist and one --set are needed (or --list, or --follow)")
+        question_set = json.loads(Path(args.set[0]).read_text())
         client = anthropic.Anthropic(max_retries=API_MAX_RETRIES)
 
         def progress(event):

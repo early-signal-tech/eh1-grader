@@ -196,7 +196,7 @@ def test_grade_a_setlist(traces, question_set):
     assert events[0]["event"] == "grade_start" and events[0]["to_grade"] == 5
     assert len(client.calls) == 4  # X1 has no check, so no judge
     first = client.calls[0]
-    assert first["output_config"]["format"]["type"] == "json_schema" and first["model"] == "claude-sonnet-5-5"
+    assert first["output_config"]["format"]["type"] == "json_schema" and first["model"] == "claude-haiku-5-5"
     assert "tool_choice" not in first
 
     grades = {g["run_id"]: g for g in read_grades(traces, "sl-1", summary.grader_key)}
@@ -220,8 +220,8 @@ def test_grade_a_setlist(traces, question_set):
     assert traces.execute("SELECT count(*) FROM eval_grades").fetchone()[0] == 5  # replaced, not added
 
     # Different settings: new rows beside the old ones.
-    haiku = GraderSettings(judge_model="claude-haiku-5-5")
-    other = grade_setlist(traces, question_set, "sl-1", haiku, client=FakeClient())
+    sonnet = GraderSettings(judge_model="claude-sonnet-5-5")
+    other = grade_setlist(traces, question_set, "sl-1", sonnet, client=FakeClient())
     assert other.grader_key != summary.grader_key and other.graded == 5
     assert traces.execute("SELECT count(*) FROM eval_grades").fetchone()[0] == 10
 
@@ -533,3 +533,94 @@ def test_hello_reports_versions(tmp_path):
     assert hello["version"] not in ("", "unknown")
     assert hello["traces_schema"] == SCHEMA_VERSION  # the agent's, from the package it was built with
     assert hello["grades_schema"] == GRADES_SCHEMA and len(GRADES_SCHEMA) == 12
+
+
+# --- following DH-1 ---
+
+def end(traces, run_id, minutes_ago=0):
+    traces.conn.execute(f"UPDATE agent_runs SET ended_at = now() - INTERVAL {int(minutes_ago)} MINUTE WHERE run_id = ?",
+                        [run_id])
+
+
+def test_follow_grades_setlists_that_play_after_it_starts(traces, question_set):
+    from eh1_grader.follow import Follower
+    add_run(traces, "old1", "A1", setlist_run="sl-old")
+    end(traces, "old1", minutes_ago=60)
+    add_run(traces, "mid1", "A1", setlist_run="sl-mid")
+    end(traces, "mid1", minutes_ago=30)  # finished before following began, but its setlist plays on
+    events = []
+    follower = Follower(traces, [question_set], client=FakeClient(), on_event=events.append)
+    assert events[0]["event"] == "follow_start"
+    assert follower.check() == 0  # nothing new yet
+
+    add_run(traces, "mid2", "H1", setlist_run="sl-mid")
+    add_run(traces, "new1", "A1", setlist_run="sl-new")
+    add_run(traces, "new2", "A1", column="B", setlist_run="sl-new")  # still running: no ended_at
+    end(traces, "mid2")
+    end(traces, "new1")
+    assert follower.check() == 3
+    graded = {(e["setlist_run"], e["run_id"]) for e in events if e["event"] == "graded"}
+    assert graded == {("sl-mid", "mid1"), ("sl-mid", "mid2"), ("sl-new", "new1")}  # not sl-old, not new2 yet
+
+    end(traces, "new2")
+    assert follower.check() == 1
+    assert follower.check() == 0  # nothing twice
+    assert traces.execute("SELECT count(*) FROM eval_grades WHERE run_id LIKE 'old%'").fetchone()[0] == 0
+    assert follower.totals.graded == 4
+
+
+def test_follow_skips_a_setlist_without_its_question_set(traces, question_set):
+    from eh1_grader.follow import Follower
+    events = []
+    follower = Follower(traces, [question_set], client=FakeClient(), on_event=events.append)
+    labels = {"setlist": "other", "setlist_revision": 1, "setlist_run": "sl-x", "question": "Q1", "column": "A", "repeat": 1}
+    add_run(traces, "x1", "Q1", labels=labels)
+    end(traces, "x1")
+    follower.check()
+    follower.check()
+    skipped = [e for e in events if e["event"] == "follow_skipped"]
+    assert len(skipped) == 1 and skipped[0]["setlist_run"] == "sl-x" and "other" in skipped[0]["reason"]
+
+
+def test_follow_uses_the_revision_the_setlist_ran(question_set):
+    from eh1_grader.follow import set_for
+    r2 = {**question_set, "revision": 2}
+    assert set_for("mini", 1, [r2, question_set]) is question_set
+    assert set_for("mini", 1, [r2]) is r2  # the one you have
+    assert set_for("nope", 1, [question_set]) is None
+
+
+def test_serve_follow_then_stop(tmp_path, question_set):
+    import time
+    path = str(tmp_path / "traces.duckdb")
+    out = Output()
+    server = Server(None, out, path, traces_server=False, client=FakeClient())
+    server.handle({"id": "f", "type": "follow", "question_sets": [question_set], "interval": 0.05})
+    time.sleep(0.3)  # follow_start, with nothing new
+    writer = init_traces_db(path)  # traces_server=False: the server's connection and this one share the file
+    add_run(writer, "r1", "A1", setlist_run="sl-live")
+    end(writer, "r1")
+    deadline = time.time() + 5
+    while time.time() < deadline and not any(m.get("event") == "graded" for m in out.messages()):
+        time.sleep(0.05)
+    server.handle({"id": "s", "type": "stop", "grade": "f"})
+    server.wait_all(5)
+    writer.close()
+    messages = [m for m in out.messages() if m["id"] == "f"]
+    assert messages[0]["type"] == "accepted"
+    assert [m["event"] for m in messages if m["type"] == "event"][:2] == ["follow_start", "graded"]
+    result = messages[-1]
+    assert result["type"] == "result" and result["result"]["graded"] == 1 and result["result"]["cancelled"]
+
+
+def test_a_new_follow_replaces_the_old(tmp_path, question_set):
+    out = Output()
+    server = Server(None, out, str(tmp_path / "traces.duckdb"), traces_server=False, client=FakeClient())
+    server.handle({"id": "f1", "type": "follow", "question_sets": [question_set], "interval": 0.05})
+    server.handle({"id": "f2", "type": "follow", "question_sets": [question_set], "interval": 0.05})
+    import time
+    time.sleep(0.3)
+    server.handle({"id": "s", "type": "stop", "grade": "f2"})
+    server.wait_all(5)
+    results = {m["id"] for m in out.messages() if m["type"] == "result"}
+    assert results == {"f1", "f2"}  # f1 ended when f2 began; f2 when stopped
