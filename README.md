@@ -78,8 +78,10 @@ every question set the setlists might use; a setlist whose set isn't given is sk
 Only setlists are followed: single runs and A/B compares are graded when you ask. The
 rack's AUTO-GRADE is the same thing, through the `follow` request (follow.py).
 
-The judge defaults to `claude-sonnet-5-5` at low effort. It answers with structured
-output (a JSON schema), since Sonnet 5.5 and Opus 5.5 reject a forced tool choice.
+The judge defaults to `claude-haiku-5-5` at low effort (about a tenth of a cent a run,
+so following a setlist stays cheap); `--judge-model claude-sonnet-5-5` or Opus for a
+closer read. It answers with structured output (a JSON schema), since Sonnet 5.5 and
+Opus 5.5 reject a forced tool choice.
 
 ## How EFFICIENT is scored
 

@@ -196,7 +196,7 @@ def test_grade_a_setlist(traces, question_set):
     assert events[0]["event"] == "grade_start" and events[0]["to_grade"] == 5
     assert len(client.calls) == 4  # X1 has no check, so no judge
     first = client.calls[0]
-    assert first["output_config"]["format"]["type"] == "json_schema" and first["model"] == "claude-sonnet-5-5"
+    assert first["output_config"]["format"]["type"] == "json_schema" and first["model"] == "claude-haiku-5-5"
     assert "tool_choice" not in first
 
     grades = {g["run_id"]: g for g in read_grades(traces, "sl-1", summary.grader_key)}
@@ -220,8 +220,8 @@ def test_grade_a_setlist(traces, question_set):
     assert traces.execute("SELECT count(*) FROM eval_grades").fetchone()[0] == 5  # replaced, not added
 
     # Different settings: new rows beside the old ones.
-    haiku = GraderSettings(judge_model="claude-haiku-5-5")
-    other = grade_setlist(traces, question_set, "sl-1", haiku, client=FakeClient())
+    sonnet = GraderSettings(judge_model="claude-sonnet-5-5")
+    other = grade_setlist(traces, question_set, "sl-1", sonnet, client=FakeClient())
     assert other.grader_key != summary.grader_key and other.graded == 5
     assert traces.execute("SELECT count(*) FROM eval_grades").fetchone()[0] == 10
 

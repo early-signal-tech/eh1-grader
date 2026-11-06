@@ -17,7 +17,9 @@ from duckdb_agent.usage import estimate_cost as agent_estimate_cost
 # differs / unverified, instead of a matches flag.
 JUDGE_VERSION = 2
 
-DEFAULT_JUDGE_MODEL = "claude-sonnet-5-5"
+# Haiku at low effort: about a tenth of a cent a run, so following a setlist (AUTO-GRADE)
+# stays cheap. Sonnet and Opus are a click away when a grade needs a closer read.
+DEFAULT_JUDGE_MODEL = "claude-haiku-5-5"
 DEFAULT_JUDGE_EFFORT = "low"
 JUDGE_MAX_TOKENS = 8000
 MAX_ANSWER_CHARS = 20_000
