@@ -33,9 +33,17 @@ Requests (each has an "id" and a "type"; every message names its request's "id")
     {"type": "override", "run_id": "…", "question_set": {...}, "grader": {...},
      "override": {"correct": 0-2, "careful": 0-2, "why": "…"} | null}  -> {"type": "ok"}
         (null clears it; regrading keeps it)
-    {"type": "stop", "grade": "<id of a grade request>"}  -> {"type": "ok"}
+    {"type": "stop", "grade": "<id of a grade or follow request>"}  -> {"type": "ok"}
 "grade" also takes "run_ids": [...] to grade just those runs again (one scorecard cell).
 "override" takes "grader_key" in place of "question_set" + "grader" (for quick checks).
+
+Following DH-1 (the rack's AUTO-GRADE; see follow.py):
+    {"type": "follow", "grader": {...}, "question_sets": [{...a set's JSON}, ...], "interval": 5}
+        -> {"type": "accepted"}
+        -> {"type": "event", "event": "follow_start" | "graded" | "grade_error" | "follow_skipped",
+            "setlist_run": "sl-…", ...}  (as setlists' runs finish and are graded)
+        -> {"type": "result", "result": {graded, judge_cost_usd, errors, cancelled}}  (after "stop")
+    Only one follow runs at a time: a new one (new grader settings, say) replaces it.
 
 RUN mode, one run at a time:
     {"type": "runs", "kind": "all" | "single" | "ab" | "setlist", "search": "…", "limit": 100}
@@ -65,6 +73,7 @@ from importlib.metadata import PackageNotFoundError, version
 from duckdb_agent import SCHEMA_VERSION, connect_traces_db
 from duckdb_agent.config import API_MAX_RETRIES
 
+from .follow import DEFAULT_INTERVAL_SECONDS, Follower, FollowTotals, grading_revision
 from .grade import GraderSettings, check_question_set, grade_one, grade_setlist, grader_key
 from .judge import JUDGE_PRICING, SCALE
 from .traces import (
@@ -81,17 +90,6 @@ def grader_version() -> str:
         return version("eh1-grader")
     except PackageNotFoundError:
         return "unknown"
-
-
-def grading_revision(setlist: dict, sets: list[dict]) -> int:
-    """The question set revision the app grades a setlist with: the one it ran, when the app
-    has it; else the first the app has with that id; else the one it ran (as the app's
-    findSet)."""
-    same = [s.get("revision", 1) for s in sets if s["id"] == setlist["question_set"]]
-    ran = setlist.get("revision")
-    if ran is None:
-        return same[0] if same else 1
-    return ran if ran in same or not same else same[0]
 
 
 class Server:
@@ -174,6 +172,8 @@ class Server:
                 self.start_grade(rid, request)
             elif kind == "override":
                 self.override(rid, request)
+            elif kind == "follow":
+                self.start_follow(rid, request)
             elif kind == "stop":
                 with self._jobs_lock:
                     job = self._jobs.get(request.get("grade"))
@@ -314,6 +314,50 @@ class Server:
         thread = threading.Thread(target=work, name=f"grade-{rid}", daemon=True)
         with self._jobs_lock:
             self._jobs[rid] = {"thread": thread, "cancel": cancel}
+        self.send({"id": rid, "type": "accepted"})
+        thread.start()
+
+    def start_follow(self, rid: str, request: dict) -> None:
+        sets = request.get("question_sets")
+        if not isinstance(sets, list):
+            raise ValueError('"question_sets" must be a list of question sets')
+        for question_set in sets:
+            check_question_set(question_set)
+        settings = GraderSettings.from_dict(request.get("grader"))
+        interval = float(request.get("interval") or DEFAULT_INTERVAL_SECONDS)
+        cancel = threading.Event()
+        with self._jobs_lock:
+            # One follow at a time: a new one replaces the old. It waits for the old one to
+            # finish the runs it's grading, so no run is graded (and paid for) twice.
+            replaced = [job["thread"] for job in self._jobs.values() if job.get("follow")]
+            for job in self._jobs.values():
+                if job.get("follow"):
+                    job["cancel"].set()
+
+        def work():
+            traces = None
+            try:
+                for thread in replaced:
+                    thread.join()
+                if cancel.is_set():  # replaced or stopped while waiting
+                    self.send({"id": rid, "type": "result", "result": dataclasses.asdict(FollowTotals(cancelled=True))})
+                    return
+                traces = self.traces()
+                follower = Follower(traces, sets, settings, self.client, cancel=cancel,
+                                    on_event=lambda event: self.send({"id": rid, "type": "event", **event}))
+                totals = follower.run(interval)
+                self.send({"id": rid, "type": "result", "result": dataclasses.asdict(totals)})
+            except Exception as e:
+                self.error(rid, f"{type(e).__name__}: {e}")
+            finally:
+                if traces is not None:
+                    traces.close()
+                with self._jobs_lock:
+                    self._jobs.pop(rid, None)
+
+        thread = threading.Thread(target=work, name=f"follow-{rid}", daemon=True)
+        with self._jobs_lock:
+            self._jobs[rid] = {"thread": thread, "cancel": cancel, "follow": True}
         self.send({"id": rid, "type": "accepted"})
         thread.start()
 
