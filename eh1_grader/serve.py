@@ -343,9 +343,12 @@ class Server:
                     self.send({"id": rid, "type": "result", "result": dataclasses.asdict(FollowTotals(cancelled=True))})
                     return
                 traces = self.traces()
-                follower = Follower(traces, sets, settings, self.client, cancel=cancel,
+                follower = Follower(traces, sets, settings, self.client, cancel=cancel, reconnect=self.traces,
                                     on_event=lambda event: self.send({"id": rid, "type": "event", **event}))
-                totals = follower.run(interval)
+                try:
+                    totals = follower.run(interval)
+                finally:
+                    traces = follower.traces  # it may have reconnected: close the one it ended with
                 self.send({"id": rid, "type": "result", "result": dataclasses.asdict(totals)})
             except Exception as e:
                 self.error(rid, f"{type(e).__name__}: {e}")

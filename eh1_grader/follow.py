@@ -11,6 +11,10 @@ and A/B compares are graded when you ask (RUN mode).
 A setlist is graded with its own question set, chosen from the sets given the way the app
 chooses (grading_revision). A setlist whose set isn't given is reported once and skipped.
 A run that fails to grade isn't tried again while following.
+
+Following can sit idle for a long time between setlists. If a check fails (the traces
+server lets an idle connection's lease lapse: "Connection heartbeat lease expired"), the
+follower opens a new connection and carries on at the next check, rather than stopping.
 """
 
 import threading
@@ -85,12 +89,19 @@ class Follower:
         {"event": "graded", "setlist_run", "run_id", "question", ...}   (as grade_setlist)
         {"event": "grade_error", "setlist_run", "run_id", "error"}
         {"event": "follow_skipped", "setlist_run", "question_set", "revision", "reason"}
+        {"event": "follow_retry", "error"}       (a check failed; reconnecting)
+        {"event": "follow_reconnected"}          (following again)
+
+    With `reconnect` (a function that opens the traces again), a failed check reconnects
+    and following goes on; without it, the failure ends `run`.
     """
 
     def __init__(self, traces: TracesDB, question_sets: list[dict], settings: GraderSettings | None = None,
                  client: anthropic.Anthropic | None = None, on_event: Callable[[dict], None] | None = None,
-                 cancel: threading.Event | None = None, concurrency: int = 4):
+                 cancel: threading.Event | None = None, concurrency: int = 4,
+                 reconnect: Callable[[], TracesDB] | None = None):
         self.traces, self.sets = traces, question_sets
+        self.reconnect = reconnect
         self.settings = settings or GraderSettings()
         self.client, self.concurrency = client, concurrency
         self.emit = on_event or (lambda event: None)
@@ -135,9 +146,29 @@ class Follower:
             self.emit({**event, "setlist_run": setlist_run})
 
     def run(self, interval: float = DEFAULT_INTERVAL_SECONDS) -> FollowTotals:
-        """Check, then wait `interval` seconds, until cancelled."""
+        """Check, then wait `interval` seconds, until cancelled. A failed check reconnects
+        (with `reconnect`) and following goes on; the next check tries again."""
+        broken = False
         while not self.cancel.is_set():
-            self.check()
+            try:
+                if broken:
+                    self._reopen()
+                    broken = False
+                    self.emit({"event": "follow_reconnected"})
+                self.check()
+            except Exception as e:
+                if self.reconnect is None:
+                    raise
+                if not broken:  # say it once, not every interval while it stays down
+                    self.emit({"event": "follow_retry", "error": f"{type(e).__name__}: {e}"})
+                broken = True
             self.cancel.wait(interval)
         self.totals.cancelled = True
         return self.totals
+
+    def _reopen(self) -> None:
+        try:
+            self.traces.close()
+        except Exception:
+            pass  # it's the broken one
+        self.traces = self.reconnect()
