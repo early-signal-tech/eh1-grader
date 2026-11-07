@@ -624,3 +624,44 @@ def test_a_new_follow_replaces_the_old(tmp_path, question_set):
     server.wait_all(5)
     results = {m["id"] for m in out.messages() if m["type"] == "result"}
     assert results == {"f1", "f2"}  # f1 ended when f2 began; f2 when stopped
+
+
+def test_follow_reconnects_after_a_failed_check(traces, question_set):
+    """An idle connection to the traces server can expire; following reconnects and goes on.
+    While reconnecting keeps failing, it says so once."""
+    from eh1_grader.follow import Follower
+    events = []
+    cancel = threading.Event()
+    attempts = {"reconnect": 0, "check": 0}
+
+    def reconnect():
+        attempts["reconnect"] += 1
+        if attempts["reconnect"] == 1:
+            raise RuntimeError("traces server not answering")  # still down the first time
+        return traces
+
+    follower = Follower(traces, [question_set], client=FakeClient(), on_event=events.append, cancel=cancel, reconnect=reconnect)
+    original = follower.check
+
+    def flaky_check():
+        attempts["check"] += 1
+        if attempts["check"] == 1:
+            raise RuntimeError("Invalid Input Error: Connection heartbeat lease expired")
+        cancel.set()
+        return original()
+
+    follower.check = flaky_check
+    follower.traces.close = lambda: None  # don't close the fixture's connection on reopen
+    totals = follower.run(interval=0.01)
+    kinds = [e["event"] for e in events]
+    assert kinds == ["follow_start", "follow_retry", "follow_reconnected"]
+    assert "lease expired" in events[1]["error"]
+    assert attempts == {"reconnect": 2, "check": 2} and totals.cancelled
+
+
+def test_follow_without_reconnect_still_stops_on_a_failure(traces, question_set):
+    from eh1_grader.follow import Follower
+    follower = Follower(traces, [question_set], client=FakeClient())
+    follower.check = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    with pytest.raises(RuntimeError, match="boom"):
+        follower.run(interval=0.01)
