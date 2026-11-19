@@ -119,3 +119,7 @@ eh1_grader/
   serve.py       the app protocol (JSON Lines)
   cli.py         eh1-grade
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
